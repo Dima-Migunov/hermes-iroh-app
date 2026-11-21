@@ -31,7 +31,7 @@ export function MessageItem({ message, onCopy }: MessageItemProps) {
       ) : (
         <div className="markdown">
           <ReactMarkdown
-            remarkPlugins={isUser ? [remarkGfm, remarkBreaks] : [remarkGfm]}
+            remarkPlugins={[remarkGfm, remarkBreaks]}
             rehypePlugins={[rehypeSanitize, rehypeHighlight]}
           >
             {message.content}

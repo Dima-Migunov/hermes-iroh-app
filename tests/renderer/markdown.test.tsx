@@ -55,11 +55,14 @@ describe('MessageItem markdown rendering', () => {
     expect(html).not.toContain('**bold**')
   })
 
-  it('preserves single line breaks in user messages', () => {
-    const html = render('first line\nsecond line', { role: 'user' })
+  it.each(['user', 'assistant'] as const)(
+    'preserves single line breaks in %s messages',
+    (role) => {
+      const html = render('first line\nsecond line', { role })
 
-    expect(html).toMatch(/first line<br\/?>\s*second line/)
-  })
+      expect(html).toMatch(/first line<br\/?>\s*second line/)
+    },
+  )
 
   it('offers answer copying only for completed assistant messages', () => {
     expect(render('done')).toContain('Copy answer')
