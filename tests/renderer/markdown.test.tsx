@@ -32,21 +32,33 @@ describe('MessageItem markdown rendering', () => {
     expect(text).toContain('const value: number = 1')
   })
 
-  it('does not emit executable markup for embedded HTML', () => {
-    const html = render('before\n\n<script>window.__pwned = true</script>\n\nafter')
+  it.each(['assistant', 'user'] as const)(
+    'does not emit executable markup for embedded HTML in %s messages',
+    (role) => {
+      const html = render(
+        'before\n\n<script>window.__pwned = true</script>\n\n[link](javascript:alert(1))\n\nafter',
+        { role },
+      )
 
-    expect(html).not.toContain('<script')
-    expect(html.toLowerCase()).not.toContain('javascript:')
-    expect(html).toContain('before')
-    expect(html).toContain('after')
+      expect(html).not.toContain('<script')
+      expect(html.toLowerCase()).not.toContain('javascript:')
+      expect(html).toContain('before')
+      expect(html).toContain('after')
+    },
+  )
+
+  it('renders Markdown in user messages', () => {
+    const html = render('**bold** and `code`', { role: 'user' })
+
+    expect(html).toContain('<strong>bold</strong>')
+    expect(html).toContain('<code>code</code>')
+    expect(html).not.toContain('**bold**')
   })
 
-  it('renders user messages as escaped plain text', () => {
-    const html = render('<b>not bold</b>', { role: 'user' })
+  it('preserves single line breaks in user messages', () => {
+    const html = render('first line\nsecond line', { role: 'user' })
 
-    expect(html).toContain('plain-text')
-    expect(html).toContain('&lt;b&gt;not bold&lt;/b&gt;')
-    expect(html).not.toContain('<b>not bold</b>')
+    expect(html).toMatch(/first line<br\/?>\s*second line/)
   })
 
   it('offers answer copying only for completed assistant messages', () => {

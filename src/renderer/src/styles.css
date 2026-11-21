@@ -363,12 +363,6 @@ textarea:disabled {
   margin-left: auto;
 }
 
-.plain-text {
-  margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
 .thinking {
   margin: 0;
   color: var(--text-muted);

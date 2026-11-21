@@ -1,6 +1,7 @@
 import ReactMarkdown from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeSanitize from 'rehype-sanitize'
+import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 import type { StoredMessage } from '@shared/protocol'
 import { CopyButton } from './CopyButton'
@@ -25,14 +26,12 @@ export function MessageItem({ message, onCopy }: MessageItemProps) {
         ) : null}
       </header>
 
-      {isUser ? (
-        <p className="plain-text">{message.content}</p>
-      ) : message.content.length === 0 && message.status === 'streaming' ? (
+      {!isUser && message.content.length === 0 && message.status === 'streaming' ? (
         <p className="thinking">Assistant is responding…</p>
       ) : (
         <div className="markdown">
           <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
+            remarkPlugins={isUser ? [remarkGfm, remarkBreaks] : [remarkGfm]}
             rehypePlugins={[rehypeSanitize, rehypeHighlight]}
           >
             {message.content}
