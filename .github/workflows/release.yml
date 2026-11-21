@@ -109,6 +109,10 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download installers
         uses: actions/download-artifact@v4
         with:
@@ -140,6 +144,21 @@ jobs:
           files=(*.exe *.dmg *.zip *.AppImage *.deb)
           sha256sum "${files[@]}" > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          previous=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+          {
+            echo "## Changes"
+            if [ -n "$previous" ]; then
+              git log --no-merges --pretty='- %s' "${previous}..${tag}"
+            else
+              git log --no-merges --pretty='- %s' "${tag}"
+            fi
+          } > release/RELEASE_NOTES.md
+          cat release/RELEASE_NOTES.md
       - name: Publish release
         shell: bash
         run: |
@@ -156,11 +175,11 @@ jobs:
             case "$tag" in
               *-*) prerelease_args=(--prerelease) ;;
             esac
-            gh release create "$tag" --draft --verify-tag --generate-notes "${prerelease_args[@]}"
+            gh release create "$tag" --draft --verify-tag --notes-file release/RELEASE_NOTES.md "${prerelease_args[@]}"
           fi
           gh release upload "$tag" release/*.exe release/*.dmg release/*.zip release/*.AppImage release/*.deb release/SHA256SUMS.txt --clobber
           if [[ "$tag" == *-* ]]; then
-            gh release edit "$tag" --draft=false --prerelease
+            gh release edit "$tag" --draft=false --notes-file release/RELEASE_NOTES.md --prerelease
           else
-            gh release edit "$tag" --draft=false
+            gh release edit "$tag" --draft=false --notes-file release/RELEASE_NOTES.md
           fi

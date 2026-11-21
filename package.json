@@ -1,6 +1,6 @@
 {
   "name": "iroh-channel-desktop",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Desktop client for the Hermes Agent Iroh-channel plugin",
   "main": "./out/main/index.js",
   "license": "MIT",
