@@ -35,13 +35,14 @@ class FakeRecvStream implements RecvStreamLike {
 }
 
 class FakeBiStream implements BiStreamLike {
+  readonly chunks: Uint8Array[]
   readonly written: number[] = []
   readonly finish = vi.fn(async () => undefined)
   readonly read = vi.fn(async () => {
     const chunk = this.chunks.shift()
     return chunk ? Array.from(chunk) : []
   })
-  readonly recv: RecvStreamLike = new FakeRecvStream(() => this.read())
+  readonly recv: RecvStreamLike
   readonly send = {
     writeAll: vi.fn(async (bytes: number[]) => {
       this.written.push(...bytes)
@@ -49,7 +50,10 @@ class FakeBiStream implements BiStreamLike {
     finish: this.finish,
   }
 
-  constructor(public chunks: Uint8Array[] = []) {}
+  constructor(chunks: Uint8Array[] = [], recv?: RecvStreamLike) {
+    this.chunks = chunks
+    this.recv = recv ?? new FakeRecvStream(() => this.read())
+  }
 }
 
 class FakeConnection implements ConnectionLike {
@@ -337,6 +341,7 @@ describe('IrohClient prompt streaming', () => {
         .join(''),
     ).toBe('Hello')
     expect(biStream.recv.stop).toBeDefined()
+    expect(biStream.recv.stop).toHaveBeenCalledTimes(1)
   })
 
   it('surfaces a server error message', async () => {
@@ -373,6 +378,68 @@ describe('IrohClient prompt streaming', () => {
 
     expect(events.map((event) => event.type)).toEqual(['start', 'delta', 'done'])
     expect(biStream.read).toHaveBeenCalledTimes(1)
+  })
+
+  it('abandons a stream that opens after the request was aborted', async () => {
+    const biStream = new FakeBiStream()
+    const { client, connection } = await connectedWithStream(biStream)
+    const opened = new Deferred<BiStreamLike>()
+    connection.openBi.mockReturnValue(opened.promise)
+    const controller = new AbortController()
+    const events: PromptEvent[] = []
+
+    const streaming = client.streamPrompt({
+      requestId: 'request-1',
+      sessionId: 'session-1',
+      text: 'hello',
+      emit: (event) => events.push(event),
+      signal: controller.signal,
+    })
+
+    await vi.waitFor(() => expect(connection.openBi).toHaveBeenCalled())
+    controller.abort()
+    opened.resolve(biStream)
+    await streaming
+
+    expect(events).toEqual([])
+    expect(biStream.send.writeAll).not.toHaveBeenCalled()
+    expect(biStream.recv.stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops a pending read and emits no error when aborted during streaming', async () => {
+    let resolveRead: ((value: ArrayLike<number>) => void) | null = null
+    let readStarted = false
+    const stop = vi.fn(async () => {
+      resolveRead?.([])
+    })
+    const recv: RecvStreamLike = {
+      read: () => {
+        readStarted = true
+        return new Promise<ArrayLike<number>>((resolve) => {
+          resolveRead = resolve
+        })
+      },
+      stop,
+    }
+    const biStream = new FakeBiStream([], recv)
+    const { client } = await connectedWithStream(biStream)
+    const controller = new AbortController()
+    const events: PromptEvent[] = []
+
+    const streaming = client.streamPrompt({
+      requestId: 'request-1',
+      sessionId: 'session-1',
+      text: 'hello',
+      emit: (event) => events.push(event),
+      signal: controller.signal,
+    })
+
+    await vi.waitFor(() => expect(readStarted).toBe(true))
+    controller.abort()
+    await streaming
+
+    expect(events).toEqual([])
+    expect(stop).toHaveBeenCalledTimes(1)
   })
 
   it('maps a read failure to a terminal error', async () => {

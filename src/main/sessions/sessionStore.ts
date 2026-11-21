@@ -186,6 +186,20 @@ export class SessionStore {
     this.notify()
   }
 
+  async interruptAssistant(sessionId: string, messageId: string | null): Promise<void> {
+    const messages = this.messagesBySession.get(sessionId)
+    const message = messageId
+      ? messages?.find((candidate) => candidate.id === messageId)
+      : undefined
+    if (message) {
+      message.status = 'interrupted'
+      const session = this.index.sessions.find((candidate) => candidate.id === sessionId)
+      if (session) session.updatedAt = this.now().toISOString()
+    }
+    await this.flush(sessionId)
+    this.notify()
+  }
+
   async failRequest(
     sessionId: string,
     assistantMessageId: string | null,

@@ -53,6 +53,7 @@ export interface PromptStreamRequest {
   sessionId: string
   text: string
   emit: (event: PromptEvent) => void
+  signal?: AbortSignal
 }
 
 export interface IrohClientOptions {
@@ -136,20 +137,46 @@ export class IrohClient {
   }
 
   async streamPrompt(request: PromptStreamRequest): Promise<void> {
+    const { signal } = request
     const machine = new PromptStateMachine(request.requestId, request.sessionId, request.emit)
     let stream: BiStreamLike | null = null
+    let stopPromise: Promise<void> | null = null
+    let cancelled = signal?.aborted ?? false
+
+    const stopReceive = (): Promise<void> => {
+      const target = stream
+      if (!target?.recv.stop) return Promise.resolve()
+      if (!stopPromise) {
+        stopPromise = target.recv.stop(0n).catch(() => undefined)
+      }
+      return stopPromise
+    }
+
+    const onAbort = (): void => {
+      cancelled = true
+      void stopReceive()
+    }
+
+    signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
+      if (cancelled) return
+
       const connection = await this.ensureConnection()
+      if (cancelled) return
+
       stream = await connection.openBi()
+      if (cancelled) return
 
       const line = serializePrompt(request.sessionId, request.text)
       await stream.send.writeAll(Array.from(new TextEncoder().encode(line)))
       await stream.send.finish()
 
       const decoder = new LineDecoder()
-      while (!machine.isSettled) {
+      while (!machine.isSettled && !cancelled) {
         const chunk = await stream.recv.read(READ_CHUNK_BYTES)
+        if (cancelled) return
+
         const bytes = chunk instanceof Uint8Array ? chunk : Uint8Array.from(chunk)
 
         if (bytes.length === 0) {
@@ -160,17 +187,12 @@ export class IrohClient {
         this.forwardLines(decoder.push(bytes), machine)
       }
 
-      if (!machine.isSettled) machine.handleEof()
+      if (!machine.isSettled && !cancelled) machine.handleEof()
     } catch (error) {
-      machine.handleTransportError(error)
+      if (!cancelled) machine.handleTransportError(error)
     } finally {
-      if (stream?.recv.stop) {
-        try {
-          await stream.recv.stop(0n)
-        } catch {
-          // The peer may already have closed the stream.
-        }
-      }
+      signal?.removeEventListener('abort', onAbort)
+      await stopReceive()
     }
   }
 

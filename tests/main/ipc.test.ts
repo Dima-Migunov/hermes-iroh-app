@@ -65,6 +65,7 @@ function createHarness(overrides: Partial<IpcDeps> = {}) {
   const disconnect = vi.fn(async () => undefined)
   const connect = vi.fn(async () => ({ state: 'connected' as const }))
   const sendPrompt = vi.fn(async () => ({ requestId: 'request-1' }))
+  const cancelPrompt = vi.fn(async () => true)
   const copyText = vi.fn()
   const list = vi.fn(() => [summary])
   const create = vi.fn(async () => summary)
@@ -90,7 +91,7 @@ function createHarness(overrides: Partial<IpcDeps> = {}) {
       getSnapshot,
       getActiveSnapshot,
     } as unknown as SessionStore,
-    prompts: { sendPrompt },
+    prompts: { sendPrompt, cancelPrompt },
     copyText,
     notices: ['history warning'],
     allowedUrlPrefixes: ['file:///app/out/renderer/'],
@@ -105,6 +106,7 @@ function createHarness(overrides: Partial<IpcDeps> = {}) {
     disconnect,
     connect,
     sendPrompt,
+    cancelPrompt,
     copyText,
     list,
     create,
@@ -190,6 +192,24 @@ describe('registerIpcHandlers', () => {
       ipc.invoke(IPC.promptSend, { sessionId: 'session-1', text: 'hello' }),
     ).resolves.toEqual({ requestId: 'request-1' })
     expect(sendPrompt).toHaveBeenCalledWith({ sessionId: 'session-1', text: 'hello' })
+  })
+
+  it('delegates a prompt cancellation and returns the service result', async () => {
+    const { ipc, cancelPrompt } = createHarness()
+
+    await expect(ipc.invoke(IPC.promptCancel)).resolves.toBe(true)
+    expect(cancelPrompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a prompt cancellation from an untrusted sender', async () => {
+    const { ipc, cancelPrompt } = createHarness()
+
+    await expect(
+      ipc.invoke(IPC.promptCancel, undefined, {
+        senderFrame: { url: 'https://evil.example/app' },
+      }),
+    ).rejects.toMatchObject({ code: 'configuration' })
+    expect(cancelPrompt).not.toHaveBeenCalled()
   })
 
   it('saves a configuration and disconnects when the target changes', async () => {

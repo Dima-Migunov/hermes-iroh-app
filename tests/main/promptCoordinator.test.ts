@@ -165,6 +165,99 @@ describe('PromptCoordinator', () => {
     expect(harness.events.filter((event) => event.type === 'done')).toHaveLength(1)
   })
 
+  it('cancels a streaming response, keeps partial content, and accepts a new prompt', async () => {
+    let seen: Parameters<PromptTransport['streamPrompt']>[0] | null = null
+    const streamPrompt = vi.fn(
+      async (request: Parameters<PromptTransport['streamPrompt']>[0]) => {
+        seen = request
+        request.emit({ requestId: request.requestId, type: 'start', sessionId: request.sessionId })
+        request.emit({ requestId: request.requestId, type: 'delta', content: 'partial' })
+        await new Promise<void>((resolve) => {
+          request.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    )
+    const harness = await createHarness({ streamPrompt })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'stop me' })
+    await vi.waitFor(() => expect(seen).not.toBeNull())
+
+    await expect(harness.coordinator.cancelPrompt()).resolves.toBe(true)
+
+    expect(seen!.signal?.aborted).toBe(true)
+    expect(harness.coordinator.isBusy()).toBe(false)
+    expect(harness.events.map((event) => event.type)).toEqual(['start', 'delta', 'cancelled'])
+
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    expect(snapshot.messages.find((entry) => entry.role === 'user')?.status).toBe('complete')
+    expect(snapshot.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'interrupted',
+      content: 'partial',
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'again' })
+    expect(streamPrompt).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels before the assistant starts and treats a repeat as a no-op', async () => {
+    let seen: Parameters<PromptTransport['streamPrompt']>[0] | null = null
+    const harness = await createHarness({
+      streamPrompt: async (request) => {
+        seen = request
+        await new Promise<void>((resolve) => {
+          request.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'stop me' })
+    await vi.waitFor(() => expect(seen).not.toBeNull())
+
+    await expect(harness.coordinator.cancelPrompt()).resolves.toBe(true)
+    await expect(harness.coordinator.cancelPrompt()).resolves.toBe(false)
+
+    expect(harness.events.map((event) => event.type)).toEqual(['cancelled'])
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    expect(snapshot.messages).toHaveLength(1)
+    expect(snapshot.messages[0]).toMatchObject({ role: 'user', status: 'complete' })
+  })
+
+  it('reports that nothing was cancelled when no prompt is active', async () => {
+    const harness = await createHarness({ streamPrompt: vi.fn(async () => undefined) })
+
+    await expect(harness.coordinator.cancelPrompt()).resolves.toBe(false)
+    expect(harness.events).toEqual([])
+  })
+
+  it('ignores a done frame that arrives after cancellation', async () => {
+    let seen: Parameters<PromptTransport['streamPrompt']>[0] | null = null
+    const harness = await createHarness({
+      streamPrompt: async (request) => {
+        seen = request
+        request.emit({ requestId: request.requestId, type: 'start', sessionId: request.sessionId })
+        request.emit({ requestId: request.requestId, type: 'delta', content: 'kept' })
+        await new Promise<void>((resolve) => {
+          request.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'stop me' })
+    await vi.waitFor(() => expect(seen).not.toBeNull())
+    await harness.coordinator.cancelPrompt()
+
+    seen!.emit({ requestId: seen!.requestId, type: 'done', sessionId: seen!.sessionId })
+    seen!.emit({ requestId: seen!.requestId, type: 'delta', content: 'late' })
+
+    expect(harness.events.map((event) => event.type)).toEqual(['start', 'delta', 'cancelled'])
+
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    expect(snapshot.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'interrupted',
+      content: 'kept',
+    })
+  })
+
   it('rejects empty prompts and unknown sessions before opening a stream', async () => {
     const streamPrompt = vi.fn(async () => undefined)
     const harness = await createHarness({ streamPrompt })

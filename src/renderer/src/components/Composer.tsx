@@ -3,10 +3,12 @@ import { composerAction, isSubmittable } from '../composer'
 
 interface ComposerProps {
   disabled: boolean
+  generating: boolean
   onSend: (text: string) => Promise<boolean>
+  onStop: () => void
 }
 
-export function Composer({ disabled, onSend }: ComposerProps) {
+export function Composer({ disabled, generating, onSend, onStop }: ComposerProps) {
   const [text, setText] = useState('')
 
   const submit = (): void => {
@@ -47,9 +49,18 @@ export function Composer({ disabled, onSend }: ComposerProps) {
         disabled={disabled}
       />
       <div className="composer-actions">
-        <span className="composer-hint">Enter to send · Shift+Enter for a new line</span>
-        <button type="submit" className="primary-button" disabled={disabled || !isSubmittable(text)}>
-          Send
+        <span className="composer-hint">
+          {generating
+            ? 'Escape to stop the response'
+            : 'Enter to send · Shift+Enter for a new line'}
+        </span>
+        <button
+          type={generating ? 'button' : 'submit'}
+          className={generating ? 'primary-button stop-button' : 'primary-button'}
+          onClick={generating ? onStop : undefined}
+          disabled={generating ? false : disabled || !isSubmittable(text)}
+        >
+          {generating ? 'Stop' : 'Send'}
         </button>
       </div>
     </form>

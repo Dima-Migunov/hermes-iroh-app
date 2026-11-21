@@ -20,6 +20,7 @@ export interface ChatController {
   state: ChatState
   messages: StoredMessage[]
   sendPrompt(text: string): Promise<boolean>
+  cancelPrompt(): Promise<void>
   createSession(): Promise<void>
   activateSession(id: string): Promise<void>
   saveAndConnect(config: ClientConfig): Promise<ClientConfig>
@@ -94,6 +95,9 @@ export function useChatController(): ChatController {
           break
         case 'done':
           dispatch({ type: 'prompt/done', requestId: event.requestId })
+          break
+        case 'cancelled':
+          dispatch({ type: 'prompt/cancelled', requestId: event.requestId })
           break
         case 'error':
           dispatch({
@@ -194,6 +198,16 @@ export function useChatController(): ChatController {
     return true
   }, [])
 
+  const cancelPrompt = useCallback(async (): Promise<void> => {
+    const api = window.irohChannel
+    if (!api || !stateRef.current.generating) return
+    try {
+      await api.cancelPrompt()
+    } catch (error) {
+      dispatch({ type: 'notice/add', notice: { level: 'warning', message: messageOf(error) } })
+    }
+  }, [])
+
   const createSession = useCallback(async (): Promise<void> => {
     const api = window.irohChannel
     if (!api || stateRef.current.generating) return
@@ -248,6 +262,7 @@ export function useChatController(): ChatController {
     state,
     messages: selectActiveMessages(state),
     sendPrompt,
+    cancelPrompt,
     createSession,
     activateSession,
     saveAndConnect,

@@ -56,11 +56,25 @@ targets; adding it requires an upstream prebuilt binary or a Rust toolchain buil
    relay, enter its URL in **Relay URL**; leave it blank to use the default Iroh relay mode.
 5. Choose **Save & connect**. The status indicator changes from `Connecting…` to `Connected`.
 6. Send a message. The reply streams in token by token, renders Markdown and highlighted code,
-   and can be copied as raw Markdown from the completed message.
+   and can be copied as raw Markdown from the completed message. To stop it early, choose
+   **Stop** in place of **Send** or press `Escape`.
 
 Provide a server target: either an endpoint ticket or a server NodeId. A ticket is preferred and
 wins when both fields are filled in, in which case the NodeId is dropped. A save with neither
 target, or with an unparseable target, is rejected and the previously saved settings stay in effect.
+
+### Stopping a response
+
+While a response is generating, the composer's primary action becomes **Stop**, and `Escape`
+triggers the same action from anywhere in the window. Stopping closes the receive side of the
+prompt stream, releases the client's single-prompt lock immediately, and ignores every later
+frame from that request. The partial answer stays in the transcript with status `interrupted`,
+no error banner is shown, and the composer is available again right away.
+
+The Hermes turn may continue on the server after a stop; its output is discarded and never
+reaches the client. If a prompt sent immediately after a stop is rejected with `session_busy`,
+wait a moment and send it again. The client lock is already free; only the server's session slot
+is still settling.
 
 ### Relay configuration
 
@@ -139,6 +153,9 @@ Server response (JSON Lines):
 - Malformed JSON, invalid UTF-8, missing fields on known frames, and lines over 1 MiB are
   protocol errors that terminate the request.
 - EOF before a terminal frame becomes a `connection-closed` error that mentions the allowlist.
+- A user-initiated stop closes the receive side of the active stream and adds no protocol frame.
+  Late `delta`, `done`, or `error` frames from that request are ignored, the single-prompt lock
+  is released immediately, and the partial message is stored as `interrupted`.
 - At most one prompt is in flight. A second submission is rejected as busy.
 - Connection reuse is attempted across prompts; if the server closes the connection, the next
   prompt reconnects before sending.
@@ -153,6 +170,7 @@ Server response (JSON Lines):
 | `startup reports an identity error` | `client.key` is unreadable or not 32 bytes. Restore the backup or deliberately delete it to create a new identity. |
 | Missing native module | `@number0/iroh` could not load on this OS/arch, usually macOS Intel. Use a supported platform. |
 | Settings will not save | A target is required and the ticket/NodeId must parse. If both fields are filled the ticket wins and the NodeId is dropped. The last valid settings remain active. |
+| `session_busy` after stopping | The server has not released its session slot yet. Wait a moment and send the prompt again; the client lock is already free. |
 | History notice after launch | A history file was invalid; it was preserved as `*.corrupt-*` and that session starts empty. |
 
 ## Manual end-to-end verification
@@ -174,13 +192,17 @@ Server response (JSON Lines):
 8. Quit and relaunch. Expected: the active session and both transcripts are restored. If the
    app was quit mid-stream, the partial answer is shown as interrupted.
 9. Verify composer behavior: `Enter` sends, `Shift+Enter` inserts a newline, whitespace-only
-   input does nothing, and the composer is disabled until `done` or `error`.
+   input does nothing, and the composer is disabled until `done`, `error`, or a stop.
 10. Stop the server and send another prompt. Expected: the request fails with a timeout or
     connection error, the user message remains marked failed, and the composer becomes
     available again.
 11. Resize the window to 800×600 and tab through the settings, session list, message copy
     buttons, and composer. Expected: every control is reachable, focus is visible, and the
     connection state is conveyed by text as well as color.
+12. Start a long response, then choose **Stop**; repeat with `Escape`. Expected: the primary
+    action reads **Stop** while generating, the partial answer stays visible and is marked
+    interrupted, no error banner appears, and another prompt can be sent immediately. If the
+    server briefly answers `session_busy`, retrying after a moment succeeds.
 
 Automated checks (`npm test`) cover the same wire contract against a real in-process Iroh
 endpoint with `presetMinimal`: exact prompt bytes, start/delta/done ordering, server errors,

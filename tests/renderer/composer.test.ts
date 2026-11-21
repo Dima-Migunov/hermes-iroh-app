@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { composerAction, isSubmittable } from '@renderer/composer'
+import { composerAction, isCancelKey, isSubmittable } from '@renderer/composer'
 
 describe('composerAction', () => {
   it('sends on Enter', () => {
@@ -17,6 +17,19 @@ describe('composerAction', () => {
   it('ignores other keys', () => {
     expect(composerAction({ key: 'a', shiftKey: false })).toBe('none')
     expect(composerAction({ key: 'Escape', shiftKey: false })).toBe('none')
+  })
+})
+
+describe('isCancelKey', () => {
+  it('accepts Escape outside composition', () => {
+    expect(isCancelKey({ key: 'Escape' })).toBe(true)
+    expect(isCancelKey({ key: 'Escape', isComposing: false })).toBe(true)
+  })
+
+  it('ignores other keys and Escape during composition', () => {
+    expect(isCancelKey({ key: 'Enter' })).toBe(false)
+    expect(isCancelKey({ key: 'a' })).toBe(false)
+    expect(isCancelKey({ key: 'Escape', isComposing: true })).toBe(false)
   })
 })
 

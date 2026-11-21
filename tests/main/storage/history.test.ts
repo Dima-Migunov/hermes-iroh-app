@@ -168,6 +168,52 @@ describe('SessionStore', () => {
     expect(assistantMessage?.content).toBe('partial')
   })
 
+  it('marks only the assistant message interrupted and keeps it after reload', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await store.appendUserMessage(sessionId, 'stop me')
+    const assistant = store.beginAssistantMessage(sessionId)
+    store.appendDelta(sessionId, assistant.id, 'partial answer')
+
+    await store.interruptAssistant(sessionId, assistant.id)
+
+    const snapshot = await store.getSnapshot(sessionId)
+    expect(snapshot.messages.find((entry) => entry.role === 'user')?.status).toBe('complete')
+    expect(snapshot.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'interrupted',
+      content: 'partial answer',
+    })
+
+    const reopened = await reopen(historyDir)
+    const restored = await reopened.getSnapshot(sessionId)
+    expect(restored.messages.find((entry) => entry.role === 'user')?.status).toBe('complete')
+    expect(restored.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'interrupted',
+      content: 'partial answer',
+    })
+  })
+
+  it('flushes without adding a message when there is no assistant message id', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await store.appendUserMessage(sessionId, 'stop me')
+
+    await store.interruptAssistant(sessionId, null)
+
+    const snapshot = await store.getSnapshot(sessionId)
+    expect(snapshot.messages).toHaveLength(1)
+    expect(snapshot.messages[0]).toMatchObject({
+      role: 'user',
+      status: 'complete',
+      content: 'stop me',
+    })
+
+    const reopened = await reopen(historyDir)
+    const restored = await reopened.getSnapshot(sessionId)
+    expect(restored.messages).toHaveLength(1)
+    expect(restored.messages[0]?.status).toBe('complete')
+  })
+
   it('recovers from a corrupt session file without blocking startup', async () => {
     const { store, historyDir } = await createHarness()
     const sessionId = store.getActiveSessionId()!

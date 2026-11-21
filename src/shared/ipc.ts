@@ -20,6 +20,7 @@ export const IPC = {
   sessionsGet: 'sessions:get',
   sessionsGetActive: 'sessions:get-active',
   promptSend: 'prompt:send',
+  promptCancel: 'prompt:cancel',
   clipboardWrite: 'clipboard:write',
   promptEvent: 'prompt:event',
   connectionStatusChanged: 'connection:status-changed',
@@ -53,6 +54,7 @@ export interface IpcApi {
   getActiveSession(): Promise<SessionSnapshot>
   getNotices(): Promise<AppNotice[]>
   sendPrompt(input: PromptSubmission): Promise<PromptSubmissionResult>
+  cancelPrompt(): Promise<boolean>
   copyText(text: string): Promise<void>
   onPromptEvent(handler: (event: PromptEvent) => void): () => void
   onConnectionStatus(handler: (status: ConnectionStatus) => void): () => void

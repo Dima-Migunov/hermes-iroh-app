@@ -27,6 +27,7 @@ export interface ConnectionService {
 
 export interface PromptService {
   sendPrompt(input: PromptSubmission): Promise<PromptSubmissionResult>
+  cancelPrompt(): Promise<boolean>
 }
 
 export interface IpcDeps {
@@ -72,6 +73,7 @@ export const HANDLED_CHANNELS = [
   IPC.sessionsGet,
   IPC.sessionsGetActive,
   IPC.promptSend,
+  IPC.promptCancel,
   IPC.clipboardWrite,
   IPC.noticesGet,
 ] as const
@@ -142,6 +144,7 @@ export function registerIpcHandlers(ipc: IpcMainLike, deps: IpcDeps): void {
   handle(IPC.sessionsGetActive, null, () => deps.sessions.getActiveSnapshot())
 
   handle(IPC.promptSend, promptSchema, (input: PromptSubmission) => deps.prompts.sendPrompt(input))
+  handle(IPC.promptCancel, null, () => deps.prompts.cancelPrompt())
 
   handle(IPC.clipboardWrite, copyTextSchema, (text: string) => {
     deps.copyText(text)

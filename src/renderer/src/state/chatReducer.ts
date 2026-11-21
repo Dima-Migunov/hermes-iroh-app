@@ -68,6 +68,7 @@ export type ChatAction =
       createdAt: string
     }
   | { type: 'prompt/done'; requestId: string }
+  | { type: 'prompt/cancelled'; requestId: string }
   | {
       type: 'prompt/error'
       requestId: string
@@ -243,6 +244,34 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }))
     }
 
+    case 'prompt/cancelled': {
+      if (!state.generating) return state
+      if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
+        return state
+      }
+
+      const sessionId = state.activeSessionId
+      const assistantId = state.activeAssistantId
+      if (!sessionId || !assistantId) {
+        return { ...state, generating: false, activeRequestId: null, activeAssistantId: null }
+      }
+
+      const messages = state.transcripts[sessionId] ?? []
+      const updated = messages.map((message) =>
+        message.id === assistantId && message.status === 'streaming'
+          ? { ...message, status: 'interrupted' as const }
+          : message,
+      )
+
+      return {
+        ...state,
+        transcripts: { ...state.transcripts, [sessionId]: updated },
+        generating: false,
+        activeRequestId: null,
+        activeAssistantId: null,
+      }
+    }
+
     case 'prompt/error': {
       if (!state.generating) return state
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
@@ -350,6 +379,8 @@ export function applyPromptEventToState(
       })
     case 'done':
       return chatReducer(state, { type: 'prompt/done', requestId: event.requestId })
+    case 'cancelled':
+      return chatReducer(state, { type: 'prompt/cancelled', requestId: event.requestId })
     case 'error':
       return chatReducer(state, {
         type: 'prompt/error',

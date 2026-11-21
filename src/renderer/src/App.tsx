@@ -1,13 +1,28 @@
+import { useEffect } from 'react'
 import { Composer } from './components/Composer'
 import { SessionList } from './components/SessionList'
 import { SettingsPanel } from './components/SettingsPanel'
 import { StatusIndicator } from './components/StatusIndicator'
 import { Transcript } from './components/Transcript'
+import { isCancelKey } from './composer'
 import { useChatController } from './useChatController'
 
 export default function App() {
   const chat = useChatController()
-  const { state } = chat
+  const { state, cancelPrompt } = chat
+
+  useEffect(() => {
+    if (!state.generating) return
+
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (!isCancelKey({ key: event.key, isComposing: event.isComposing })) return
+      event.preventDefault()
+      void cancelPrompt()
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [state.generating, cancelPrompt])
 
   return (
     <div className="app">
@@ -68,7 +83,9 @@ export default function App() {
 
         <Composer
           disabled={state.generating || state.activeSessionId === null}
+          generating={state.generating}
           onSend={chat.sendPrompt}
+          onStop={() => void cancelPrompt()}
         />
       </main>
     </div>

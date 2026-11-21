@@ -196,6 +196,12 @@ textarea {
   font-weight: 600;
 }
 
+.stop-button {
+  background: #3a1a1c;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 .primary-button:hover:not(:disabled),
 .secondary-button:hover:not(:disabled),
 .copy-button:hover:not(:disabled) {

@@ -14,3 +14,12 @@ export function composerAction(input: ComposerKeyInput): ComposerAction {
 export function isSubmittable(text: string): boolean {
   return text.trim().length > 0
 }
+
+export interface CancelKeyInput {
+  key: string
+  isComposing?: boolean
+}
+
+export function isCancelKey(input: CancelKeyInput): boolean {
+  return input.key === 'Escape' && !input.isComposing
+}

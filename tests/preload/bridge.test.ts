@@ -33,6 +33,7 @@ function createHarness() {
 
 const DOCUMENTED_MEMBERS = [
   'activateSession',
+  'cancelPrompt',
   'connect',
   'copyText',
   'createSession',
@@ -73,6 +74,13 @@ describe('preload bridge', () => {
       IPC.connectionStatus,
       IPC.sessionsList,
     ])
+  })
+
+  it('dispatches prompt cancellation on its channel', async () => {
+    const { bridge, calls } = createHarness()
+
+    await expect(bridge.cancelPrompt()).resolves.toEqual({ ok: true })
+    expect(calls).toEqual([{ channel: IPC.promptCancel, args: [] }])
   })
 
   it('rejects malformed configuration before dispatch', async () => {

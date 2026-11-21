@@ -185,6 +185,70 @@ describe('chatReducer session handling', () => {
   })
 })
 
+describe('chatReducer cancellation', () => {
+  it('marks the streaming assistant interrupted and ends generation without an error', () => {
+    let state = bootstrapped()
+    state = sent(state)
+    state = chatReducer(state, { type: 'prompt/request', requestId: 'request-1' })
+    state = started(state)
+    state = chatReducer(state, {
+      type: 'prompt/delta',
+      requestId: 'request-1',
+      chunks: ['partial'],
+      createdAt: '2026-01-01T00:00:05.000Z',
+    })
+    state = chatReducer(state, { type: 'prompt/cancelled', requestId: 'request-1' })
+
+    const [user, assistant] = selectActiveMessages(state)
+    expect(user?.status).toBe('complete')
+    expect(assistant).toMatchObject({ status: 'interrupted', content: 'partial' })
+    expect(state.generating).toBe(false)
+    expect(state.activeRequestId).toBeNull()
+    expect(state.error).toBeNull()
+
+    state = sent(state, 'again')
+    expect(state.generating).toBe(true)
+  })
+
+  it('ends generation without adding an assistant message when cancelled before start', () => {
+    let state = bootstrapped()
+    state = sent(state)
+    state = chatReducer(state, { type: 'prompt/cancelled', requestId: 'request-1' })
+
+    expect(selectActiveMessages(state)).toHaveLength(1)
+    expect(selectActiveMessages(state)[0]).toMatchObject({
+      role: 'user',
+      status: 'complete',
+    })
+    expect(state.generating).toBe(false)
+    expect(state.error).toBeNull()
+  })
+
+  it('ignores a late delta after cancellation', () => {
+    let state = bootstrapped()
+    state = sent(state)
+    state = started(state)
+    state = chatReducer(state, {
+      type: 'prompt/delta',
+      requestId: 'request-1',
+      chunks: ['kept'],
+      createdAt: '2026-01-01T00:00:05.000Z',
+    })
+    state = chatReducer(state, { type: 'prompt/cancelled', requestId: 'request-1' })
+
+    const cancelled = state
+    state = chatReducer(state, {
+      type: 'prompt/delta',
+      requestId: 'request-1',
+      chunks: ['late'],
+      createdAt: '2026-01-01T00:00:06.000Z',
+    })
+
+    expect(state).toBe(cancelled)
+    expect(selectActiveMessages(state)[1]?.content).toBe('kept')
+  })
+})
+
 describe('chatReducer terminal failures', () => {
   it('marks the user and assistant messages failed, then re-enables prompting', () => {
     let state = bootstrapped()

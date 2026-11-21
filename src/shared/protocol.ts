@@ -66,6 +66,7 @@ export type PromptEvent =
   | { requestId: string; type: 'start'; sessionId: string }
   | { requestId: string; type: 'delta'; content: string }
   | { requestId: string; type: 'done'; sessionId: string }
+  | { requestId: string; type: 'cancelled'; sessionId: string }
   | { requestId: string; type: 'error'; sessionId: string; code: ErrorCode; message: string }
 
 export interface AppNotice {

@@ -155,6 +155,8 @@ export function createBridge(
         requirePromptSubmission(input),
       )) as { requestId: string },
 
+    cancelPrompt: async () => (await invoke(IPC.promptCancel)) as boolean,
+
     copyText: async (text: string) => {
       await invoke(IPC.clipboardWrite, requireString(text, 'text'))
     },

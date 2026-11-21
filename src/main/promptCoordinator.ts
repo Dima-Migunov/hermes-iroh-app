@@ -22,12 +22,18 @@ export interface ActiveRequest {
   sessionId: string
 }
 
+interface TrackedRequest extends ActiveRequest {
+  assistantMessageId: string | null
+  cancelled: boolean
+  controller: AbortController
+}
+
 export class PromptCoordinator {
   private readonly client: PromptTransport
   private readonly sessions: SessionStore
   private readonly bus: EventBus
   private readonly idFactory: () => string
-  private active: ActiveRequest | null = null
+  private active: TrackedRequest | null = null
 
   constructor(deps: PromptCoordinatorDeps) {
     this.client = deps.client
@@ -41,7 +47,8 @@ export class PromptCoordinator {
   }
 
   getActiveRequest(): ActiveRequest | null {
-    return this.active ? { ...this.active } : null
+    if (!this.active) return null
+    return { requestId: this.active.requestId, sessionId: this.active.sessionId }
   }
 
   async sendPrompt(input: PromptSubmission): Promise<PromptSubmissionResult> {
@@ -58,103 +65,126 @@ export class PromptCoordinator {
       throw new AppError('not-found', `Session "${input.sessionId}" does not exist.`)
     }
 
-    const requestId = this.idFactory()
-    const sessionId = input.sessionId
-    this.active = { requestId, sessionId }
+    const request: TrackedRequest = {
+      requestId: this.idFactory(),
+      sessionId: input.sessionId,
+      assistantMessageId: null,
+      cancelled: false,
+      controller: new AbortController(),
+    }
+    this.active = request
 
     try {
-      await this.sessions.appendUserMessage(sessionId, input.text)
+      await this.sessions.appendUserMessage(request.sessionId, input.text)
     } catch (error) {
       this.active = null
       throw error
     }
 
-    let assistantMessageId: string | null = null
     let terminalPromise: Promise<void> | null = null
 
     const release = (): void => {
-      if (this.active?.requestId === requestId) this.active = null
+      if (this.active === request) this.active = null
     }
 
     const emit = (event: PromptEvent): void => {
+      if (request.cancelled) return
+
       if (event.type === 'start') {
-        if (assistantMessageId === null) {
-          assistantMessageId = this.sessions.beginAssistantMessage(event.sessionId).id
+        if (request.assistantMessageId === null) {
+          request.assistantMessageId = this.sessions.beginAssistantMessage(event.sessionId).id
         }
         this.bus.emitPromptEvent(event)
         return
       }
 
       if (event.type === 'delta') {
-        if (assistantMessageId) {
-          this.sessions.appendDelta(sessionId, assistantMessageId, event.content)
+        if (request.assistantMessageId) {
+          this.sessions.appendDelta(request.sessionId, request.assistantMessageId, event.content)
         }
         this.bus.emitPromptEvent(event)
         return
       }
 
+      if (event.type === 'cancelled') return
+
       release()
       this.bus.emitPromptEvent(event)
-      terminalPromise = this.finish(event, assistantMessageId)
+      terminalPromise = this.finish(event, request.assistantMessageId)
     }
 
-    void this.run({
-      requestId,
-      sessionId,
-      text: input.text,
-      emit,
-      getAssistantMessageId: () => assistantMessageId,
-      getTerminalPromise: () => terminalPromise,
-    }).catch(() => undefined)
+    void this.run(request, input.text, emit, () => terminalPromise).catch(() => undefined)
 
-    return { requestId }
+    return { requestId: request.requestId }
+  }
+
+  async cancelPrompt(): Promise<boolean> {
+    const request = this.active
+    if (!request) return false
+
+    request.cancelled = true
+    this.active = null
+    request.controller.abort()
+
+    this.bus.emitPromptEvent({
+      requestId: request.requestId,
+      type: 'cancelled',
+      sessionId: request.sessionId,
+    })
+
+    try {
+      await this.sessions.interruptAssistant(request.sessionId, request.assistantMessageId)
+    } catch {
+      // Persistence failures must not turn a successful cancellation into an error.
+    }
+
+    return true
   }
 
   async shutdown(): Promise<void> {
     await this.sessions.flushAll()
   }
 
-  private async run(options: {
-    requestId: string
-    sessionId: string
-    text: string
-    emit: (event: PromptEvent) => void
-    getAssistantMessageId: () => string | null
-    getTerminalPromise: () => Promise<void> | null
-  }): Promise<void> {
+  private async run(
+    request: TrackedRequest,
+    text: string,
+    emit: (event: PromptEvent) => void,
+    getTerminalPromise: () => Promise<void> | null,
+  ): Promise<void> {
     try {
       await this.client.streamPrompt({
-        requestId: options.requestId,
-        sessionId: options.sessionId,
-        text: options.text,
-        emit: options.emit,
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        text,
+        emit,
+        signal: request.controller.signal,
       })
     } catch (error) {
-      if (this.active?.requestId === options.requestId) {
+      if (!request.cancelled && this.active === request) {
         const mapped = mapIrohError(error)
-        options.emit({
-          requestId: options.requestId,
+        emit({
+          requestId: request.requestId,
           type: 'error',
-          sessionId: options.sessionId,
+          sessionId: request.sessionId,
           code: mapped.code,
           message: mapped.message,
         })
       }
     }
 
-    if (this.active?.requestId === options.requestId) {
-      options.emit({
-        requestId: options.requestId,
+    if (!request.cancelled && this.active === request) {
+      emit({
+        requestId: request.requestId,
         type: 'error',
-        sessionId: options.sessionId,
+        sessionId: request.sessionId,
         code: 'internal',
         message: 'The prompt ended without a terminal response from the server.',
       })
     }
 
-    const terminal = options.getTerminalPromise()
+    const terminal = getTerminalPromise()
     if (terminal) await terminal
-    await this.sessions.flush(options.sessionId).catch(() => undefined)
+    await this.sessions.flush(request.sessionId).catch(() => undefined)
   }
 
   private async finish(
