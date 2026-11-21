@@ -1,6 +1,14 @@
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, session as electronSession } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  session as electronSession,
+} from 'electron'
 import { IPC } from '@shared/ipc'
 import { PRODUCTION_CSP } from '@shared/csp'
 import { EventBus } from './eventBus'
@@ -25,6 +33,15 @@ const allowedUrlPrefixes = isDevelopment
 
 let mainWindow: BrowserWindow | null = null
 let quitStarted = false
+
+function configureApplicationMenu(): void {
+  if (process.platform === 'darwin') {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }]))
+    return
+  }
+
+  Menu.setApplicationMenu(null)
+}
 
 async function createWindow(): Promise<BrowserWindow> {
   const window = new BrowserWindow({
@@ -69,6 +86,7 @@ async function createWindow(): Promise<BrowserWindow> {
 
 async function bootstrap(): Promise<void> {
   await app.whenReady()
+  configureApplicationMenu()
 
   if (!isDevelopment) {
     electronSession.defaultSession.webRequest.onHeadersReceived((details, callback) => {

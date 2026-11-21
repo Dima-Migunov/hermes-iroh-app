@@ -23,7 +23,73 @@ Platform support follows the prebuilt `@number0/iroh@1.2.0` binaries:
 If the native module cannot load on the host (for example macOS Intel), the app reports a
 startup error instead of running without Iroh.
 
-## Install and run
+## Download
+
+Prebuilt installers are published on the
+[GitHub Releases page](https://github.com/Dima-Migunov/hermes-iroh-app/releases). Download the
+asset that matches your operating system and architecture.
+
+| Platform | Architecture | Assets |
+| --- | --- | --- |
+| Windows | x64, arm64 | NSIS installer (`.exe`) |
+| macOS | arm64 (Apple Silicon) | `.dmg` disk image and `.zip` archive |
+| Linux | x64, arm64 | `.AppImage` and `.deb` |
+
+Asset names follow `iroh-channel-desktop-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`,
+`mac`, or `linux`. Linux assets use the native package tokens: `x86_64` for AppImage and `amd64`
+for deb. For version `0.2.0` the release contains:
+
+```text
+iroh-channel-desktop-0.2.0-win-x64.exe
+iroh-channel-desktop-0.2.0-win-arm64.exe
+iroh-channel-desktop-0.2.0-mac-arm64.dmg
+iroh-channel-desktop-0.2.0-mac-arm64.zip
+iroh-channel-desktop-0.2.0-linux-x86_64.AppImage
+iroh-channel-desktop-0.2.0-linux-arm64.AppImage
+iroh-channel-desktop-0.2.0-linux-amd64.deb
+iroh-channel-desktop-0.2.0-linux-arm64.deb
+SHA256SUMS.txt
+```
+
+Download `SHA256SUMS.txt` next to the installers and verify the files before installing:
+
+```bash
+sha256sum -c SHA256SUMS.txt        # Linux
+shasum -a 256 -c SHA256SUMS.txt    # macOS
+```
+
+### Opening unsigned builds
+
+Releases are not signed by a verified publisher. macOS builds are ad-hoc signed but not
+notarized, and Windows builds are certificate-unsigned, so both systems warn on first launch.
+
+**macOS.** Gatekeeper blocks the unnotarized app on first launch. Right-click (or Control-click)
+the app, choose **Open**, then confirm with **Open** again. To clear the quarantine attribute
+instead:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Iroh Channel.app"
+```
+
+**Windows.** SmartScreen may show "Windows protected your PC". Choose **More info**, then
+**Run anyway**. The installer reports an unknown publisher.
+
+**Linux AppImage.** Make the file executable and run it (use `x86_64` or `arm64` for `<arch>`):
+
+```bash
+chmod +x iroh-channel-desktop-<version>-linux-<arch>.AppImage
+./iroh-channel-desktop-<version>-linux-<arch>.AppImage
+```
+
+**Linux deb.** Install with `dpkg` (use `amd64` or `arm64` for `<arch>`):
+
+```bash
+sudo dpkg -i iroh-channel-desktop-<version>-linux-<arch>.deb
+```
+
+## Build and run from source
+
+To run from source instead of using a downloaded build:
 
 ```bash
 cd iroh-channel-desktop
@@ -44,17 +110,21 @@ targets; adding it requires an upstream prebuilt binary or a Rust toolchain buil
 1. Start Hermes Agent with the `Iroh-channel` plugin enabled and obtain either the server
    `NodeTicket` or the server `NodeId`. A ticket is preferred because it already carries
    reachable addresses; a bare `NodeId` relies on Iroh discovery.
-2. Start the desktop client. The **Client NodeId** is shown in the Connection panel. It is
-   stable across restarts and is derived from `userData/client.key`.
+2. Start the desktop client and open **Settings** from the sidebar. The **Client NodeId** is
+   shown under **Connection** on the settings page. It is stable across restarts and is derived
+   from `userData/client.key`.
 3. Copy the client `NodeId` and allow it on the server:
 
    ```text
    /iroh_allow <client_node_id>
    ```
 
-4. Paste the server ticket (or NodeId) into the settings panel. If the server uses a custom
-   relay, enter its URL in **Relay URL**; leave it blank to use the default Iroh relay mode.
-5. Choose **Save & connect**. The status indicator changes from `Connecting…` to `Connected`.
+4. Paste the server ticket (or NodeId) into the server target field on the settings page. If the
+   server uses a custom relay, enter its URL in **Relay URL**; leave it blank to use the default
+   Iroh relay mode.
+5. Choose **Save & connect**. The status indicator on the settings page changes from `Connecting…`
+   to `Connected`, and the window title follows the live connection state. Choose **Back** to
+   return to the chat view.
 6. Send a message. The reply streams in token by token, renders Markdown and highlighted code,
    and can be copied as raw Markdown from the completed message. To stop it early, choose
    **Stop** in place of **Send** or press `Escape`.
@@ -165,7 +235,7 @@ Server response (JSON Lines):
 | Symptom | Meaning and action |
 | --- | --- |
 | `Connecting…` then timeout | The server was not reachable within 30 seconds. Re-check the ticket/NodeId, relay URL, and that the plugin is running. |
-| Connection closed before a response | The client was likely rejected. Run `/iroh_allow <client_node_id>` for the NodeId shown in settings. |
+| Connection closed before a response | The client was likely rejected. Run `/iroh_allow <client_node_id>` for the NodeId shown on the settings page. |
 | Connection reset / refused | The server or relay dropped the connection. Retry, check the relay URL, and confirm the server is online. |
 | `startup reports an identity error` | `client.key` is unreadable or not 32 bytes. Restore the backup or deliberately delete it to create a new identity. |
 | Missing native module | `@number0/iroh` could not load on this OS/arch, usually macOS Intel. Use a supported platform. |
@@ -173,15 +243,53 @@ Server response (JSON Lines):
 | `session_busy` after stopping | The server has not released its session slot yet. Wait a moment and send the prompt again; the client lock is already free. |
 | History notice after launch | A history file was invalid; it was preserved as `*.corrupt-*` and that session starts empty. |
 
+## Publishing a release
+
+The release workflow (`.github/workflows/release.yml`) runs on any tag matching `v*`:
+
+1. Bump `version` in `package.json` and commit the change.
+2. Create and push a matching tag:
+
+   ```bash
+   git tag v0.2.1
+   git push origin v0.2.1
+   ```
+
+3. The workflow fails before packaging when the tag does not equal
+   `v$(node -p "require('./package.json').version")`. On success it runs type checking and the
+   test suite, builds Windows x64/arm64, macOS arm64, and Linux x64/arm64 installers, and
+   publishes one release with all eight installers plus `SHA256SUMS.txt`.
+
+For a prerelease, use a semver prerelease suffix; the GitHub Release is marked as a prerelease:
+
+```bash
+git tag v0.2.1-rc.1
+git push origin v0.2.1-rc.1
+```
+
+Re-run a failed workflow from the Actions page for the same tag. The draft-first flow reuses an
+existing draft or published release and re-uploads assets with `--clobber`.
+
+To roll back a release, delete the GitHub Release and the tag:
+
+```bash
+gh release delete v0.2.1 --yes
+git push origin --delete v0.2.1
+git tag --delete v0.2.1
+```
+
 ## Manual end-to-end verification
 
 1. Start Hermes Agent with the `Iroh-channel` plugin. Note its ticket or NodeId.
-2. Launch `npm run dev` in this directory. Expected: a window opens showing a `Disconnected`
-   status and a non-empty client NodeId.
-3. Copy the client NodeId and run `/iroh_allow <client_node_id>` on the server. Expected: the
-   server confirms the allowlist entry.
-4. Enter the server ticket (or NodeId), choose **Save & connect**. Expected: status becomes
-   `Connected`; restarting the app restores the saved settings and NodeId.
+2. Launch `npm run dev` in this directory. Expected: a window opens with the title
+   `Iroh Channel — Disconnected`, no application menu bar, a sidebar with the session list and a
+   **Settings** action, and a settings page showing a `Disconnected` status and a non-empty
+   client NodeId.
+3. Copy the client NodeId from the settings page and run `/iroh_allow <client_node_id>` on the
+   server. Expected: the server confirms the allowlist entry.
+4. On the settings page, enter the server ticket (or NodeId), choose **Save & connect**.
+   Expected: the status indicator and window title become `Connected`; restarting the app
+   restores the saved settings and NodeId.
 5. Send `Write a short Python function and explain it`. Expected: the user message appears
    immediately; the assistant message appears when streaming starts and grows in place;
    Markdown and a highlighted fenced code block render; embedded HTML is escaped.
@@ -196,9 +304,10 @@ Server response (JSON Lines):
 10. Stop the server and send another prompt. Expected: the request fails with a timeout or
     connection error, the user message remains marked failed, and the composer becomes
     available again.
-11. Resize the window to 800×600 and tab through the settings, session list, message copy
-    buttons, and composer. Expected: every control is reachable, focus is visible, and the
-    connection state is conveyed by text as well as color.
+11. Resize the window to 800×600 and tab through the sidebar **Settings** action, the settings
+    page controls, the session list, message copy buttons, and the composer. Expected: every
+    control is reachable, focus is visible, and the connection state is conveyed by text in the
+    settings status indicator and the window title as well as color.
 12. Start a long response, then choose **Stop**; repeat with `Escape`. Expected: the primary
     action reads **Stop** while generating, the partial answer stays visible and is marked
     interrupted, no error banner appears, and another prompt can be sent immediately. If the

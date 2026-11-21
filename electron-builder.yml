@@ -18,6 +18,8 @@ asarUnpack:
 
 npmRebuild: false
 
+artifactName: ${name}-${version}-${os}-${arch}.${ext}
+
 win:
   target:
     - target: nsis
@@ -31,6 +33,8 @@ nsis:
 
 mac:
   category: public.app-category.productivity
+  identity: "-"
+  hardenedRuntime: false
   target:
     - target: dmg
       arch:
