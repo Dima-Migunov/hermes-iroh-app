@@ -1,4 +1,4 @@
-# Iroh Channel Desktop
+# Hermes Iroh App
 
 A standalone Electron desktop client for the Hermes Agent `Iroh-channel` plugin. It connects
 directly to the server over Iroh using ALPN `iroh-channel/1`, keeps its own stable identity, and
@@ -7,7 +7,7 @@ not need to be installed on the client machine.
 
 ## Prerequisites
 
-- **Node.js ≥ 20.3** and npm for building from source.
+- **Node.js ≥ 22.22.2** and npm for building from source.
 - A running Hermes Agent server with the `Iroh-channel` plugin enabled, plus either its
   `NodeTicket` or its `NodeId`.
 - A client `NodeId` added to the server allowlist with `/iroh_allow <client_node_id>`.
@@ -35,19 +35,19 @@ asset that matches your operating system and architecture.
 | macOS | arm64 (Apple Silicon) | `.dmg` disk image and `.zip` archive |
 | Linux | x64, arm64 | `.AppImage` and `.deb` |
 
-Asset names follow `iroh-channel-desktop-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`,
+Asset names follow `hermes-iroh-app-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`,
 `mac`, or `linux`. Linux assets use the native package tokens: `x86_64` for AppImage and `amd64`
-for deb. For version `0.2.0` the release contains:
+for deb. For version `0.4.0` the release contains:
 
 ```text
-iroh-channel-desktop-0.2.0-win-x64.exe
-iroh-channel-desktop-0.2.0-win-arm64.exe
-iroh-channel-desktop-0.2.0-mac-arm64.dmg
-iroh-channel-desktop-0.2.0-mac-arm64.zip
-iroh-channel-desktop-0.2.0-linux-x86_64.AppImage
-iroh-channel-desktop-0.2.0-linux-arm64.AppImage
-iroh-channel-desktop-0.2.0-linux-amd64.deb
-iroh-channel-desktop-0.2.0-linux-arm64.deb
+hermes-iroh-app-0.4.0-win-x64.exe
+hermes-iroh-app-0.4.0-win-arm64.exe
+hermes-iroh-app-0.4.0-mac-arm64.dmg
+hermes-iroh-app-0.4.0-mac-arm64.zip
+hermes-iroh-app-0.4.0-linux-x86_64.AppImage
+hermes-iroh-app-0.4.0-linux-arm64.AppImage
+hermes-iroh-app-0.4.0-linux-amd64.deb
+hermes-iroh-app-0.4.0-linux-arm64.deb
 SHA256SUMS.txt
 ```
 
@@ -68,7 +68,7 @@ the app, choose **Open**, then confirm with **Open** again. To clear the quarant
 instead:
 
 ```bash
-xattr -dr com.apple.quarantine "/Applications/Iroh Channel.app"
+xattr -dr com.apple.quarantine "/Applications/Hermes Iroh App.app"
 ```
 
 **Windows.** SmartScreen may show "Windows protected your PC". Choose **More info**, then
@@ -77,14 +77,14 @@ xattr -dr com.apple.quarantine "/Applications/Iroh Channel.app"
 **Linux AppImage.** Make the file executable and run it (use `x86_64` or `arm64` for `<arch>`):
 
 ```bash
-chmod +x iroh-channel-desktop-<version>-linux-<arch>.AppImage
-./iroh-channel-desktop-<version>-linux-<arch>.AppImage
+chmod +x hermes-iroh-app-<version>-linux-<arch>.AppImage
+./hermes-iroh-app-<version>-linux-<arch>.AppImage
 ```
 
 **Linux deb.** Install with `dpkg` (use `amd64` or `arm64` for `<arch>`):
 
 ```bash
-sudo dpkg -i iroh-channel-desktop-<version>-linux-<arch>.deb
+sudo dpkg -i hermes-iroh-app-<version>-linux-<arch>.deb
 ```
 
 ## Build and run from source
@@ -92,7 +92,7 @@ sudo dpkg -i iroh-channel-desktop-<version>-linux-<arch>.deb
 To run from source instead of using a downloaded build:
 
 ```bash
-cd iroh-channel-desktop
+cd hermes-iroh-app
 npm install
 npm run dev        # Electron + Vite with hot reload
 npm run typecheck  # TypeScript for main/preload and renderer
@@ -160,9 +160,9 @@ Files live under Electron's `app.getPath('userData')`:
 
 | OS | Path |
 | --- | --- |
-| Linux | `~/.config/iroh-channel-desktop/` |
-| macOS | `~/Library/Application Support/iroh-channel-desktop/` |
-| Windows | `%APPDATA%\iroh-channel-desktop\` |
+| Linux | `~/.config/hermes-iroh-app/` |
+| macOS | `~/Library/Application Support/hermes-iroh-app/` |
+| Windows | `%APPDATA%\hermes-iroh-app\` |
 
 ```text
 userData/
@@ -282,7 +282,7 @@ git tag --delete v0.2.1
 
 1. Start Hermes Agent with the `Iroh-channel` plugin. Note its ticket or NodeId.
 2. Launch `npm run dev` in this directory. Expected: a window opens with the title
-   `Iroh Channel — Disconnected`, no application menu bar, a sidebar with the session list and a
+   `Hermes Iroh App — Disconnected`, no application menu bar, a sidebar with the session list and a
    **Settings** action, and a settings page showing a `Disconnected` status and a non-empty
    client NodeId.
 3. Copy the client NodeId from the settings page and run `/iroh_allow <client_node_id>` on the

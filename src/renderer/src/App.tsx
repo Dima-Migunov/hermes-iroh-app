@@ -58,7 +58,7 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <header className="brand">
-          <h1>Iroh Channel</h1>
+          <h1>Hermes Iroh App</h1>
         </header>
 
         <SessionList

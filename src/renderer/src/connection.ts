@@ -12,5 +12,5 @@ export function connectionLabel(state: ConnectionState): string {
 }
 
 export function formatWindowTitle(state: ConnectionState): string {
-  return `Iroh Channel — ${connectionLabel(state)}`
+  return `Hermes Iroh App — ${connectionLabel(state)}`
 }
