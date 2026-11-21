@@ -50,7 +50,7 @@ jobs:
             arch: arm64
             targets: nsis:arm64
             native: "@number0/iroh-win32-arm64-msvc"
-          - os: macos-14
+          - os: macos-15
             platform: mac
             arch: arm64
             targets: dmg:arm64 zip:arm64
