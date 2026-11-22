@@ -1,4 +1,5 @@
 import type { ClientPromptFrame, ErrorCode, PromptEvent, ServerFrame } from '@shared/protocol'
+import { normalizeResponseMetadata } from '@shared/metadata'
 import { AppError, earlyCloseMessage, mapIrohError } from './errors'
 
 export function serializePrompt(sessionId: string, text: string): string {
@@ -37,8 +38,10 @@ export function parseServerFrame(line: string): ServerFrame | null {
         throw new AppError('protocol', 'The server delta frame is missing valid content.')
       }
       return { type: 'delta', content: parsed.content }
-    case 'done':
-      return { type: 'done' }
+    case 'done': {
+      const metadata = normalizeResponseMetadata(parsed.metadata)
+      return metadata ? { type: 'done', metadata } : { type: 'done' }
+    }
     case 'error':
       if (typeof parsed.message !== 'string') {
         throw new AppError('protocol', 'The server error frame is missing a valid message.')
@@ -91,7 +94,12 @@ export class PromptStateMachine {
         return
       case 'done':
         this.terminal = true
-        this.emit({ requestId: this.requestId, type: 'done', sessionId: this.expectedSessionId })
+        this.emit({
+          requestId: this.requestId,
+          type: 'done',
+          sessionId: this.expectedSessionId,
+          ...(frame.metadata ? { metadata: frame.metadata } : {}),
+        })
         return
       case 'error':
         this.terminal = true

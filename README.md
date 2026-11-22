@@ -126,8 +126,9 @@ targets; adding it requires an upstream prebuilt binary or a Rust toolchain buil
    to `Connected`, and the window title follows the live connection state. Choose **Back** to
    return to the chat view.
 6. Send a message. The reply streams in token by token, renders Markdown and highlighted code,
-   and can be copied as raw Markdown from the completed message. To stop it early, choose
-   **Stop** in place of **Send** or press `Escape`.
+   and can be copied as raw Markdown from the completed message. To stop it — from submission
+   while waiting for the first reply through streaming — choose the stop square (■) in place of
+   the send arrow (↑) or press `Escape`.
 
 Provide a server target: either an endpoint ticket or a server NodeId. A ticket is preferred and
 wins when both fields are filled in, in which case the NodeId is dropped. A save with neither
@@ -135,11 +136,15 @@ target, or with an unparseable target, is rejected and the previously saved sett
 
 ### Stopping a response
 
-While a response is generating, the composer's primary action becomes **Stop**, and `Escape`
-triggers the same action from anywhere in the window. Stopping closes the receive side of the
-prompt stream, releases the client's single-prompt lock immediately, and ignores every later
-frame from that request. The partial answer stays in the transcript with status `interrupted`,
-no error banner is shown, and the composer is available again right away.
+From the moment a prompt is submitted — including while waiting for the assistant's first
+frame — the composer's primary action shows a stop square (■) in place of the send arrow (↑),
+and `Escape` triggers the same action from anywhere in the window. The action stays enabled
+even when the field is empty; activating it with no submittable text sends nothing. The message
+field keeps focus and stays editable while a response is in flight, so the next message can be
+drafted; pressing `Enter` does not submit it until generation ends. Stopping closes the receive
+side of the prompt stream, releases the client's single-prompt lock immediately, and ignores
+every later frame from that request. The partial answer stays in the transcript with status
+`interrupted`, no error banner is shown, and the composer is available again right away.
 
 The Hermes turn may continue on the server after a stop; its output is discarded and never
 reaches the client. If a prompt sent immediately after a stop is rejected with `session_busy`,
@@ -213,15 +218,46 @@ Server response (JSON Lines):
 ```json
 {"type":"start","session_id":"<session id>"}
 {"type":"delta","content":"token"}
-{"type":"done"}
+{"type":"done","metadata":{"schema":1,"generated_at":"2026-11-21T12:00:00.000Z","latency_ms":812}}
 {"type":"error","message":"reason"}
 ```
 
 - `start` is required before deltas; the echoed session id must match the request.
 - `delta.content` is appended in arrival order.
 - `done` and `error` are terminal. Unknown frame types are ignored.
+- `done` may carry an optional `metadata` object. A bare `{"type":"done"}` remains valid and
+  completes the response exactly as before. `error` never carries metadata.
+- The client shows the latest completed response's model, compact context, and estimated cost in
+  small right-aligned text under the message field. Metadata is never rendered inside transcript
+  messages.
 - Malformed JSON, invalid UTF-8, missing fields on known frames, and lines over 1 MiB are
   protocol errors that terminate the request.
+
+### Response metadata
+
+A successful `done` frame may include `metadata` describing the turn. The server caps it at
+4096 bytes and omits it when no metadata is available.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema` | integer | Metadata version; currently `1` |
+| `generated_at` | string | ISO-8601 UTC timestamp when the terminal frame was built |
+| `latency_ms` | integer | Milliseconds from prompt acceptance to the terminal frame |
+| `model` | string | Model that produced the turn, when reported |
+| `provider` | string | Provider for that model, when reported |
+| `usage` | object | Per-turn token counts: `input_tokens`, `output_tokens`, `total_tokens`, and `reasoning_tokens`, `cache_read_tokens`, `cache_write_tokens` when available |
+| `session_usage` | object | Cumulative conversation counters: `input_tokens`, `output_tokens`, `total_tokens`, `api_calls`, `estimated_cost_usd`, `cost_status`, `cost_source`, and the context fields `context_tokens`, `context_length`, `context_percent` when available |
+| `balance` | object | Account view: `provider`, `remaining_micros`, `remaining_usd`, `subscription_micros`, `subscription_usd`, `subscription_limit_usd`, `purchased_micros`, `purchased_usd`, `paid_access`, `as_of_ms`, and an optional `plan_gauge` with `id`, `label`, `used_bp`, `resets_at_ms` |
+
+- `schema`, `generated_at`, and `latency_ms` are always present; every other field is omitted
+  when the server does not expose the value. `usage` describes one turn while `session_usage`
+  describes the whole conversation.
+- Unknown fields at every level are ignored and a newer integer `schema` is accepted, so the
+  metadata can grow without a protocol revision.
+- Metadata that is not an object or lacks a valid required field is discarded. The turn still
+  completes with a bare `done` and no protocol error; metadata on an `error` frame is ignored.
+- The client stores recognized metadata with the completed assistant message, so the composer
+  status survives session switches and restarts.
 - EOF before a terminal frame becomes a `connection-closed` error that mentions the allowlist.
 - A user-initiated stop closes the receive side of the active stream and adds no protocol frame.
   Late `delta`, `done`, or `error` frames from that request are ignored, the single-prompt lock
@@ -300,7 +336,9 @@ git tag --delete v0.2.1
 8. Quit and relaunch. Expected: the active session and both transcripts are restored. If the
    app was quit mid-stream, the partial answer is shown as interrupted.
 9. Verify composer behavior: `Enter` sends, `Shift+Enter` inserts a newline, whitespace-only
-   input does nothing, and the composer is disabled until `done`, `error`, or a stop.
+   input does nothing, the primary action stays enabled (showing the stop square ■ from
+   submission until `done`, `error`, or a stop), and the message field keeps focus and stays
+   editable while a response is in flight, with only submission blocked.
 10. Stop the server and send another prompt. Expected: the request fails with a timeout or
     connection error, the user message remains marked failed, and the composer becomes
     available again.
@@ -308,10 +346,22 @@ git tag --delete v0.2.1
     page controls, the session list, message copy buttons, and the composer. Expected: every
     control is reachable, focus is visible, and the connection state is conveyed by text in the
     settings status indicator and the window title as well as color.
-12. Start a long response, then choose **Stop**; repeat with `Escape`. Expected: the primary
-    action reads **Stop** while generating, the partial answer stays visible and is marked
-    interrupted, no error banner appears, and another prompt can be sent immediately. If the
-    server briefly answers `session_busy`, retrying after a moment succeeds.
+12. Start a long response, then choose the stop button (■); repeat with `Escape`. Expected: the
+    primary action shows the stop square while generating, the partial answer stays visible and
+    is marked interrupted, no error banner appears, and another prompt can be sent immediately.
+    If the server briefly answers `session_busy`, retrying after a moment succeeds.
+13. With `Iroh-channel` plugin 1.2.0 or newer running on the server, send a prompt. Expected:
+    small right-aligned text under the message field shows the model, compact context, and
+    estimated cost from the latest completed response, for example
+    `Qwen/Qwen3.7-Flash 217.4K / 1M (22%) $0.00`. The completed message itself shows no metadata
+    text, and absent values are omitted rather than shown as `null`, `0`, or a dash.
+14. Restart the desktop app and reopen the session. Expected: the composer status shows the
+    restored values. Switch to another session and back: expected, the status follows the active
+    session and is absent when that session has no completed metadata.
+15. Connect to a server that sends a bare `{"type":"done"}` (an older plugin or no available
+    metadata). Expected: the response completes normally, no composer status appears, and no error
+    appears. Stop a response mid-stream against a metadata-capable server: expected, the partial
+    message is marked interrupted and the composer status keeps its previous values.
 
 Automated checks (`npm test`) cover the same wire contract against a real in-process Iroh
 endpoint with `presetMinimal`: exact prompt bytes, start/delta/done ordering, server errors,

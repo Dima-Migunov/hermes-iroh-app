@@ -4,6 +4,7 @@ import type {
   ConnectionStatus,
   ErrorCode,
   PromptEvent,
+  ResponseMetadata,
   SessionSnapshot,
   SessionSummary,
   StoredMessage,
@@ -67,7 +68,7 @@ export type ChatAction =
       chunks: string[]
       createdAt: string
     }
-  | { type: 'prompt/done'; requestId: string }
+  | { type: 'prompt/done'; requestId: string; metadata?: ResponseMetadata }
   | { type: 'prompt/cancelled'; requestId: string }
   | {
       type: 'prompt/error'
@@ -241,6 +242,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return finishGeneration(state, (message) => ({
         ...message,
         status: 'complete',
+        ...(action.metadata ? { metadata: action.metadata } : {}),
       }))
     }
 
@@ -362,6 +364,17 @@ export function selectActiveMessages(state: ChatState): StoredMessage[] {
   return state.transcripts[state.activeSessionId] ?? []
 }
 
+export function selectLatestResponseMetadata(state: ChatState): ResponseMetadata | undefined {
+  const messages = selectActiveMessages(state)
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role === 'assistant' && message.status === 'complete' && message.metadata) {
+      return message.metadata
+    }
+  }
+  return undefined
+}
+
 export function applyPromptEventToState(
   state: ChatState,
   event: PromptEvent,
@@ -378,7 +391,11 @@ export function applyPromptEventToState(
         createdAt,
       })
     case 'done':
-      return chatReducer(state, { type: 'prompt/done', requestId: event.requestId })
+      return chatReducer(state, {
+        type: 'prompt/done',
+        requestId: event.requestId,
+        metadata: event.metadata,
+      })
     case 'cancelled':
       return chatReducer(state, { type: 'prompt/cancelled', requestId: event.requestId })
     case 'error':

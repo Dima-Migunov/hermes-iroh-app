@@ -1,6 +1,7 @@
 import { readFile, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SessionSummary, StoredMessage } from '@shared/protocol'
+import { normalizeResponseMetadata } from '@shared/metadata'
 import { writeFileAtomic } from './atomicFile'
 import { errorMessage } from '../errors'
 
@@ -115,7 +116,7 @@ export class HistoryStore {
       if (!Array.isArray(messages) || !messages.every(isStoredMessage)) {
         throw new Error('The session document has invalid messages.')
       }
-      return { messages: messages.map((message) => ({ ...message })) }
+      return { messages: messages.map(normalizeStoredMessage) }
     } catch (error) {
       await preserveCorruptFile(filePath)
       return {
@@ -184,6 +185,13 @@ function isStoredMessage(value: unknown): value is StoredMessage {
       record.status === 'failed' ||
       record.status === 'interrupted')
   )
+}
+
+function normalizeStoredMessage(message: StoredMessage): StoredMessage {
+  const { metadata, ...rest } = message
+  if (metadata === undefined) return { ...rest }
+  const normalized = normalizeResponseMetadata(metadata)
+  return normalized ? { ...rest, metadata: normalized } : { ...rest }
 }
 
 function isMissingFile(error: unknown): boolean {

@@ -2,11 +2,22 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { StoredMessage } from '@shared/protocol'
+import type { ResponseMetadata, StoredMessage } from '@shared/protocol'
 import { HistoryStore } from '@main/storage/history'
 import { SessionStore } from '@main/sessions/sessionStore'
 
 const directories: string[] = []
+
+const metadata: ResponseMetadata = {
+  schema: 1,
+  generated_at: '2026-11-21T12:00:00.000Z',
+  latency_ms: 812,
+  model: 'gpt-5.1',
+  provider: 'openai',
+  usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+  session_usage: { total_tokens: 12600, api_calls: 8, context_percent: 6.6 },
+  balance: { remaining_usd: 12.5, paid_access: true, as_of_ms: 1763726400000 },
+}
 
 interface Harness {
   historyDir: string
@@ -166,6 +177,150 @@ describe('SessionStore', () => {
     expect(user?.error?.message).toBe('the server failed')
     expect(assistantMessage?.status).toBe('failed')
     expect(assistantMessage?.content).toBe('partial')
+  })
+
+  it('persists and restores assistant metadata', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await store.appendUserMessage(sessionId, 'hi')
+    const assistant = store.beginAssistantMessage(sessionId)
+    store.appendDelta(sessionId, assistant.id, 'Hello')
+    await store.completeAssistant(sessionId, assistant.id, metadata)
+
+    const snapshot = await store.getSnapshot(sessionId)
+    expect(snapshot.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'complete',
+      metadata,
+    })
+
+    const reopened = await reopen(historyDir)
+    const restored = await reopened.getSnapshot(sessionId)
+    expect(restored.messages.find((entry) => entry.role === 'assistant')).toMatchObject({
+      status: 'complete',
+      content: 'Hello',
+      metadata,
+    })
+  })
+
+  it('restores metadata after switching sessions', async () => {
+    const { store } = await createHarness()
+    const firstId = store.getActiveSessionId()!
+    await store.appendUserMessage(firstId, 'first')
+    const assistant = store.beginAssistantMessage(firstId)
+    store.appendDelta(firstId, assistant.id, 'answer')
+    await store.completeAssistant(firstId, assistant.id, metadata)
+
+    const second = await store.create()
+    await store.appendUserMessage(second.id, 'second')
+    await store.activate(firstId)
+
+    const snapshot = await store.getActiveSnapshot()
+    expect(snapshot.messages.find((entry) => entry.role === 'assistant')?.metadata).toEqual(metadata)
+  })
+
+  it('loads a history file written before metadata existed', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await writeFile(
+      join(historyDir, `${sessionId}.json`),
+      JSON.stringify({
+        version: 1,
+        sessionId,
+        messages: [
+          {
+            id: 'old-message',
+            role: 'assistant',
+            content: 'old answer',
+            createdAt: '2025-01-01T00:00:00.000Z',
+            status: 'complete',
+          },
+        ],
+      }),
+    )
+
+    const reopened = await reopen(historyDir)
+    const snapshot = await reopened.getActiveSnapshot()
+
+    expect(snapshot.messages).toEqual([
+      {
+        id: 'old-message',
+        role: 'assistant',
+        content: 'old answer',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        status: 'complete',
+      },
+    ])
+    expect(reopened.getWarnings()).toEqual([])
+  })
+
+  it('keeps a message whose stored metadata is unusable', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await writeFile(
+      join(historyDir, `${sessionId}.json`),
+      JSON.stringify({
+        version: 1,
+        sessionId,
+        messages: [
+          {
+            id: 'kept-message',
+            role: 'assistant',
+            content: 'kept answer',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            status: 'complete',
+            metadata: { schema: '1', generated_at: 'not a date', latency_ms: -1 },
+          },
+        ],
+      }),
+    )
+
+    const reopened = await reopen(historyDir)
+    const snapshot = await reopened.getActiveSnapshot()
+
+    expect(snapshot.messages).toHaveLength(1)
+    expect(snapshot.messages[0]).toMatchObject({
+      id: 'kept-message',
+      content: 'kept answer',
+      status: 'complete',
+    })
+    expect(snapshot.messages[0]?.metadata).toBeUndefined()
+    expect(reopened.getWarnings()).toEqual([])
+
+    const entries = await readdir(historyDir)
+    expect(entries.some((entry) => entry.includes('.corrupt-'))).toBe(false)
+  })
+
+  it('drops unknown stored metadata fields and keeps recognized values', async () => {
+    const { store, historyDir } = await createHarness()
+    const sessionId = store.getActiveSessionId()!
+    await writeFile(
+      join(historyDir, `${sessionId}.json`),
+      JSON.stringify({
+        version: 1,
+        sessionId,
+        messages: [
+          {
+            id: 'message-1',
+            role: 'assistant',
+            content: 'answer',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            status: 'complete',
+            metadata: {
+              ...metadata,
+              unknown_top: 'dropped',
+              usage: { input_tokens: 1200, unknown_counter: 4 },
+            },
+          },
+        ],
+      }),
+    )
+
+    const reopened = await reopen(historyDir)
+    const snapshot = await reopened.getActiveSnapshot()
+    expect(snapshot.messages[0]?.metadata).toEqual({
+      ...metadata,
+      usage: { input_tokens: 1200 },
+    })
   })
 
   it('marks only the assistant message interrupted and keeps it after reload', async () => {

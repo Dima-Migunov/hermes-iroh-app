@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { ClientConfig, SessionSnapshot, SessionSummary, StoredMessage } from '@shared/protocol'
+import type {
+  ClientConfig,
+  ResponseMetadata,
+  SessionSnapshot,
+  SessionSummary,
+  StoredMessage,
+} from '@shared/protocol'
 import {
   chatReducer,
   initialChatState,
@@ -121,6 +127,81 @@ describe('chatReducer transcript assembly', () => {
     })
 
     expect(selectActiveMessages(stale)[1]?.content).toBe('kept')
+  })
+})
+
+describe('chatReducer response metadata', () => {
+  const metadata: ResponseMetadata = {
+    schema: 1,
+    generated_at: '2026-11-21T12:00:00.000Z',
+    latency_ms: 812,
+    model: 'gpt-5.1',
+    provider: 'openai',
+    usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+    session_usage: { total_tokens: 12600, context_percent: 6.6 },
+    balance: { remaining_usd: 12.5, paid_access: true },
+  }
+
+  function streaming(): ChatState {
+    let state = bootstrapped()
+    state = sent(state)
+    state = chatReducer(state, { type: 'prompt/request', requestId: 'request-1' })
+    state = started(state)
+    return chatReducer(state, {
+      type: 'prompt/delta',
+      requestId: 'request-1',
+      chunks: ['Hello'],
+      createdAt: '2026-01-01T00:00:05.000Z',
+    })
+  }
+
+  it('attaches done metadata to the completed assistant message', () => {
+    let state = streaming()
+    state = chatReducer(state, {
+      type: 'prompt/done',
+      requestId: 'request-1',
+      metadata,
+    })
+
+    expect(selectActiveMessages(state)[1]).toMatchObject({
+      status: 'complete',
+      content: 'Hello',
+      metadata,
+    })
+  })
+
+  it('keeps metadata absent when the response is cancelled', () => {
+    let state = streaming()
+    state = chatReducer(state, { type: 'prompt/cancelled', requestId: 'request-1' })
+
+    expect(selectActiveMessages(state)[1]?.metadata).toBeUndefined()
+  })
+
+  it('keeps metadata absent when the response fails', () => {
+    let state = streaming()
+    state = chatReducer(state, {
+      type: 'prompt/error',
+      requestId: 'request-1',
+      sessionId: 'session-a',
+      code: 'server',
+      message: 'server exploded',
+    })
+
+    expect(selectActiveMessages(state)[1]?.metadata).toBeUndefined()
+  })
+
+  it('ignores a late done carrying metadata after a terminal outcome', () => {
+    let state = streaming()
+    state = chatReducer(state, { type: 'prompt/cancelled', requestId: 'request-1' })
+    const cancelled = state
+    state = chatReducer(state, {
+      type: 'prompt/done',
+      requestId: 'request-1',
+      metadata,
+    })
+
+    expect(state).toBe(cancelled)
+    expect(selectActiveMessages(state)[1]?.metadata).toBeUndefined()
   })
 })
 

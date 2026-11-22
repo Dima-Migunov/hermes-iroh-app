@@ -1,5 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import type { ErrorCode, SessionSnapshot, SessionSummary, StoredMessage } from '@shared/protocol'
+import type {
+  ErrorCode,
+  ResponseMetadata,
+  SessionSnapshot,
+  SessionSummary,
+  StoredMessage,
+} from '@shared/protocol'
 import type { HistoryIndex, HistoryStore } from '../storage/history'
 import { AppError } from '../errors'
 
@@ -174,11 +180,16 @@ export class SessionStore {
     this.scheduleSave(sessionId)
   }
 
-  async completeAssistant(sessionId: string, messageId: string): Promise<void> {
+  async completeAssistant(
+    sessionId: string,
+    messageId: string,
+    metadata?: ResponseMetadata,
+  ): Promise<void> {
     const messages = this.messagesBySession.get(sessionId)
     const message = messages?.find((candidate) => candidate.id === messageId)
     if (message) {
       message.status = 'complete'
+      if (metadata) message.metadata = metadata
       const session = this.index.sessions.find((candidate) => candidate.id === sessionId)
       if (session) session.updatedAt = this.now().toISOString()
     }

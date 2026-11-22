@@ -542,25 +542,68 @@ textarea:disabled {
 }
 
 .composer textarea {
-  resize: vertical;
+  resize: none;
   min-height: 64px;
+}
+
+.composer-field {
+  position: relative;
+  background: #0b0f13;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.composer-field:focus-within {
+  border-color: var(--accent);
+}
+
+.composer-field textarea {
+  display: block;
+  padding-right: 64px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+}
+
+.composer-field textarea:focus-visible {
+  outline: none;
+}
+
+.composer-send-button {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-top: 0;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .composer-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-}
-
-.composer-actions .primary-button {
-  margin-top: 0;
-  padding: 8px 18px;
+  flex-wrap: wrap;
+  gap: 2px 12px;
 }
 
 .composer-hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.composer-metadata {
+  margin-left: auto;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .empty-state {

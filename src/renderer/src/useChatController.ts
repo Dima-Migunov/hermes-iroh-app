@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react'
-import type { ClientConfig, PromptEvent, StoredMessage } from '@shared/protocol'
+import type {
+  ClientConfig,
+  PromptEvent,
+  ResponseMetadata,
+  StoredMessage,
+} from '@shared/protocol'
 import {
   chatReducer,
   initialChatState,
   selectActiveMessages,
+  selectLatestResponseMetadata,
   type ChatState,
 } from './state/chatReducer'
 
@@ -19,6 +25,7 @@ function createId(): string {
 export interface ChatController {
   state: ChatState
   messages: StoredMessage[]
+  latestMetadata: ResponseMetadata | undefined
   sendPrompt(text: string): Promise<boolean>
   cancelPrompt(): Promise<void>
   createSession(): Promise<void>
@@ -94,7 +101,11 @@ export function useChatController(): ChatController {
           dispatch({ type: 'prompt/start', requestId: event.requestId, createdAt })
           break
         case 'done':
-          dispatch({ type: 'prompt/done', requestId: event.requestId })
+          dispatch({
+            type: 'prompt/done',
+            requestId: event.requestId,
+            metadata: event.metadata,
+          })
           break
         case 'cancelled':
           dispatch({ type: 'prompt/cancelled', requestId: event.requestId })
@@ -261,6 +272,7 @@ export function useChatController(): ChatController {
   return {
     state,
     messages: selectActiveMessages(state),
+    latestMetadata: selectLatestResponseMetadata(state),
     sendPrompt,
     cancelPrompt,
     createSession,

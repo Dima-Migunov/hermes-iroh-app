@@ -116,8 +116,9 @@ export default function App() {
           />
 
           <Composer
-            disabled={state.generating || state.activeSessionId === null}
+            disabled={state.activeSessionId === null}
             generating={state.generating}
+            metadata={chat.latestMetadata}
             onSend={chat.sendPrompt}
             onStop={() => void cancelPrompt()}
           />

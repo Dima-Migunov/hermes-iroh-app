@@ -194,7 +194,11 @@ export class PromptCoordinator {
     try {
       if (event.type === 'done') {
         if (assistantMessageId) {
-          await this.sessions.completeAssistant(event.sessionId, assistantMessageId)
+          await this.sessions.completeAssistant(
+            event.sessionId,
+            assistantMessageId,
+            event.metadata,
+          )
         }
       } else {
         await this.sessions.failRequest(event.sessionId, assistantMessageId, {

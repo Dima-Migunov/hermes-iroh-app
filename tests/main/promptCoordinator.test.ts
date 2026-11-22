@@ -2,13 +2,24 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { PromptEvent } from '@shared/protocol'
+import type { PromptEvent, ResponseMetadata } from '@shared/protocol'
 import { EventBus } from '@main/eventBus'
 import { PromptCoordinator, type PromptTransport } from '@main/promptCoordinator'
 import { SessionStore } from '@main/sessions/sessionStore'
 import { HistoryStore } from '@main/storage/history'
 
 const directories: string[] = []
+
+const metadata: ResponseMetadata = {
+  schema: 1,
+  generated_at: '2026-11-21T12:00:00.000Z',
+  latency_ms: 812,
+  model: 'gpt-5.1',
+  provider: 'openai',
+  usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+  session_usage: { total_tokens: 12600, context_tokens: 8400, context_length: 128000 },
+  balance: { remaining_usd: 12.5, paid_access: true },
+}
 
 interface Harness {
   coordinator: PromptCoordinator
@@ -99,6 +110,76 @@ describe('PromptCoordinator', () => {
 
     await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'again' })
     expect(streamPrompt).toHaveBeenCalledTimes(2)
+  })
+
+  it('stores done metadata on the completed assistant message', async () => {
+    const harness = await createHarness({
+      streamPrompt: async (request) => {
+        request.emit({ requestId: request.requestId, type: 'start', sessionId: request.sessionId })
+        request.emit({ requestId: request.requestId, type: 'delta', content: 'Hello' })
+        request.emit({
+          requestId: request.requestId,
+          type: 'done',
+          sessionId: request.sessionId,
+          metadata,
+        })
+      },
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'hi' })
+    await vi.waitFor(() => expect(harness.coordinator.isBusy()).toBe(false))
+
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    const assistant = snapshot.messages.find((message) => message.role === 'assistant')
+    expect(assistant).toMatchObject({ status: 'complete', content: 'Hello', metadata })
+    expect(harness.events.find((event) => event.type === 'done')).toMatchObject({ metadata })
+  })
+
+  it('leaves metadata absent when the request fails', async () => {
+    const harness = await createHarness({
+      streamPrompt: async (request) => {
+        request.emit({ requestId: request.requestId, type: 'start', sessionId: request.sessionId })
+        request.emit({ requestId: request.requestId, type: 'delta', content: 'partial' })
+        request.emit({
+          requestId: request.requestId,
+          type: 'error',
+          sessionId: request.sessionId,
+          code: 'server',
+          message: 'server exploded',
+        })
+      },
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'fail' })
+    await vi.waitFor(() => expect(harness.coordinator.isBusy()).toBe(false))
+
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    const assistant = snapshot.messages.find((message) => message.role === 'assistant')
+    expect(assistant?.status).toBe('failed')
+    expect(assistant?.metadata).toBeUndefined()
+  })
+
+  it('leaves metadata absent when the request is cancelled', async () => {
+    let seen: Parameters<PromptTransport['streamPrompt']>[0] | null = null
+    const harness = await createHarness({
+      streamPrompt: async (request) => {
+        seen = request
+        request.emit({ requestId: request.requestId, type: 'start', sessionId: request.sessionId })
+        request.emit({ requestId: request.requestId, type: 'delta', content: 'partial' })
+        await new Promise<void>((resolve) => {
+          request.signal?.addEventListener('abort', () => resolve(), { once: true })
+        })
+      },
+    })
+
+    await harness.coordinator.sendPrompt({ sessionId: harness.sessionId, text: 'stop me' })
+    await vi.waitFor(() => expect(seen).not.toBeNull())
+    await harness.coordinator.cancelPrompt()
+
+    const snapshot = await harness.sessions.getSnapshot(harness.sessionId)
+    const assistant = snapshot.messages.find((message) => message.role === 'assistant')
+    expect(assistant?.status).toBe('interrupted')
+    expect(assistant?.metadata).toBeUndefined()
   })
 
   it('marks the request failed and releases the lock on a server error', async () => {
