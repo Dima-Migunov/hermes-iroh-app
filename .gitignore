@@ -1,10 +1,12 @@
 # Dependencies
 node_modules/
 
-# Build output (electron-vite) and packaged installers (electron-builder)
+# Build output: Vite renderer and Tauri bundles
 out/
 dist/
-release/
+/release/
+src-tauri/target/
+src-tauri/gen/
 
 # TypeScript / Vite caches
 *.tsbuildinfo
@@ -28,8 +30,8 @@ pnpm-debug.log*
 !.env.example
 
 # Local runtime data (Iroh keys, session history, config)
-# The app stores these in Electron userData outside the repo;
-# these patterns catch stray copies created during manual testing.
+# The app stores these outside the repo; these patterns catch stray copies
+# created during manual testing.
 client.key
 server.key
 *.iroh-key
@@ -44,3 +46,6 @@ ehthumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Container build caches
+.cache/

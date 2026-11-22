@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "sessionId": "session-beta",
+  "messages": [
+    {
+      "id": "message-failed-user",
+      "role": "user",
+      "content": "old prompt",
+      "createdAt": "2026-01-01T00:00:10.000Z",
+      "status": "failed",
+      "error": {
+        "code": "connection-closed",
+        "message": "The server closed the connection."
+      }
+    },
+    {
+      "id": "message-streaming",
+      "role": "assistant",
+      "content": "partial answer",
+      "createdAt": "2026-01-01T00:00:11.000Z",
+      "status": "streaming"
+    }
+  ]
+}

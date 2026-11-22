@@ -1,29 +1,43 @@
 # Hermes Iroh App
 
-A standalone Electron desktop client for the Hermes Agent
+A standalone desktop client for the Hermes Agent
 [`Iroh-channel`](https://github.com/Dima-Migunov/hermes-iroh-channel) plugin. It connects
 directly to the server over Iroh using ALPN `iroh-channel/1`, keeps its own stable identity, and
 streams agent responses into a local chat UI. Hermes Agent, Python, and the server runtime do
 not need to be installed on the client machine.
 
+The desktop shell is Tauri v2. The UI is a React 19 + Vite renderer rendered by the operating
+system webview, and the privileged backend is a Rust process that links the `iroh` crate
+directly. No browser engine or Node.js runtime is bundled in the installers.
+
 ## Prerequisites
 
-- **Node.js ≥ 22.22.2** and npm for building from source.
+Building from source requires:
+
+- **Node.js ≥ 26.13.1** and npm.
+- **Rust stable** (1.91 or newer) with `cargo`.
+- On Linux, the WebKitGTK 4.1 development package and the usual Tauri build dependencies.
 - A running Hermes Agent server with the
   [`Iroh-channel` plugin](https://github.com/Dima-Migunov/hermes-iroh-channel) enabled, plus
-  either its `NodeTicket` or its `NodeId`.
+  either its endpoint ticket or its `NodeId`.
 - A client `NodeId` added to the server allowlist with `/iroh_allow <client_node_id>`.
 
-Platform support follows the prebuilt `@number0/iroh@1.2.0` binaries:
+On Debian/Ubuntu, install the Linux build dependencies with:
+
+```bash
+sudo apt-get install \
+  build-essential curl file libayatana-appindicator3-dev librsvg2-dev libssl-dev \
+  libwebkit2gtk-4.1-dev libxdo-dev patchelf wget
+```
+
+The installed application uses the WebKitGTK 4.1 runtime supplied by the operating system. It
+is not bundled, which keeps the installers small. Supported targets are:
 
 | Platform | Architectures | Notes |
 | --- | --- | --- |
-| Windows | x64, arm64 | NSIS installer |
-| macOS | arm64 only | No Intel (x64) prebuilt binary exists for 1.2.0 |
-| Linux | x64, arm64 | glibc and musl; AppImage and deb |
-
-If the native module cannot load on the host (for example macOS Intel), the app reports a
-startup error instead of running without Iroh.
+| Windows | x64, arm64 | NSIS installer; uses the bundled WebView2 runtime |
+| macOS | arm64 only | No Intel (x64) build is published |
+| Linux | x64, arm64 | WebKitGTK 4.1 required; AppImage and deb |
 
 ## Server plugin
 
@@ -62,19 +76,20 @@ asset that matches your operating system and architecture.
 | macOS | arm64 (Apple Silicon) | `.dmg` disk image and `.zip` archive |
 | Linux | x64, arm64 | `.AppImage` and `.deb` |
 
-Asset names follow `hermes-iroh-app-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`,
-`mac`, or `linux`. Linux assets use the native package tokens: `x86_64` for AppImage and `amd64`
-for deb. For version `0.4.0` the release contains:
+Every installer is at most 25 MB. Asset names follow
+`hermes-iroh-app-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`, `mac`, or `linux`.
+Linux assets use the native package tokens: `x86_64` for AppImage and `amd64` for deb. For
+version `0.7.0` the release contains:
 
 ```text
-hermes-iroh-app-0.4.0-win-x64.exe
-hermes-iroh-app-0.4.0-win-arm64.exe
-hermes-iroh-app-0.4.0-mac-arm64.dmg
-hermes-iroh-app-0.4.0-mac-arm64.zip
-hermes-iroh-app-0.4.0-linux-x86_64.AppImage
-hermes-iroh-app-0.4.0-linux-arm64.AppImage
-hermes-iroh-app-0.4.0-linux-amd64.deb
-hermes-iroh-app-0.4.0-linux-arm64.deb
+hermes-iroh-app-0.7.0-win-x64.exe
+hermes-iroh-app-0.7.0-win-arm64.exe
+hermes-iroh-app-0.7.0-mac-arm64.dmg
+hermes-iroh-app-0.7.0-mac-arm64.zip
+hermes-iroh-app-0.7.0-linux-x86_64.AppImage
+hermes-iroh-app-0.7.0-linux-arm64.AppImage
+hermes-iroh-app-0.7.0-linux-amd64.deb
+hermes-iroh-app-0.7.0-linux-arm64.deb
 SHA256SUMS.txt
 ```
 
@@ -101,14 +116,17 @@ xattr -dr com.apple.quarantine "/Applications/Hermes Iroh App.app"
 **Windows.** SmartScreen may show "Windows protected your PC". Choose **More info**, then
 **Run anyway**. The installer reports an unknown publisher.
 
-**Linux AppImage.** Make the file executable and run it (use `x86_64` or `arm64` for `<arch>`):
+**Linux AppImage.** Install the WebKitGTK 4.1 runtime (for example
+`sudo apt-get install libwebkit2gtk-4.1-0`), make the file executable, and run it (use `x86_64`
+or `arm64` for `<arch>`):
 
 ```bash
 chmod +x hermes-iroh-app-<version>-linux-<arch>.AppImage
 ./hermes-iroh-app-<version>-linux-<arch>.AppImage
 ```
 
-**Linux deb.** Install with `dpkg` (use `amd64` or `arm64` for `<arch>`):
+**Linux deb.** Install with `dpkg` (use `amd64` or `arm64` for `<arch>`). The package declares
+its WebKitGTK 4.1 dependency:
 
 ```bash
 sudo dpkg -i hermes-iroh-app-<version>-linux-<arch>.deb
@@ -121,25 +139,67 @@ To run from source instead of using a downloaded build:
 ```bash
 cd hermes-iroh-app
 npm install
-npm run dev        # Electron + Vite with hot reload
-npm run typecheck  # TypeScript for main/preload and renderer
-npm test           # Vitest unit + local Iroh integration tests
-npm run build      # compile to out/
-npm run package    # build installers for the current platform into dist/
+npm run tauri dev  # desktop window with Vite hot reload
+npm run typecheck  # TypeScript for the renderer and bridge
+npm test           # Vitest renderer and release-tooling tests
+npm run build      # compile the renderer into out/renderer
+npm run package    # build installers for the current platform into src-tauri/target
 ```
 
-`npm run package` produces the configured target for the OS it runs on (NSIS on Windows,
-DMG/ZIP on macOS, AppImage/deb on Linux). macOS Intel is intentionally absent from the build
-targets; adding it requires an upstream prebuilt binary or a Rust toolchain build pipeline.
+The Rust backend is checked and tested separately:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+```
+
+Use `npm run package`, `npx tauri build`, or `npm run tauri dev` to create a runnable
+application. A bare `cargo build --release` omits Tauri's `custom-protocol` production
+feature, so that binary tries to load the Vite development URL instead of the embedded
+assets. The `cargo` commands above are only for checking and testing the backend.
+
+`npm run package` produces the configured bundles for the OS it runs on (NSIS on Windows,
+DMG/app on macOS, AppImage/deb on Linux). On Linux it builds the deb with Tauri and the
+AppImage with `scripts/build-appimage.sh`, which packages only the application binary and
+relies on the system WebKitGTK 4.1 so the image stays within the 25 MB budget. A bare
+`npx tauri build` also honors the `appimage` target in `tauri.conf.json`, but Tauri's AppImage
+bundler deploys WebKitGTK itself and is not used for releases. Tauri's raw bundle output is
+renamed into the release contract by `npm run release:collect`, and `npm run release:size`
+enforces the 25 MB budget. macOS Intel is intentionally absent from the build targets.
+
+### Architecture
+
+```text
+src/renderer/        React 19 UI, chat state, Markdown and highlighting
+src/renderer/src/bridge.ts
+                     typed Tauri command/event adapter with the IpcApi shape
+src/shared/          renderer-facing TypeScript protocol and bridge types
+src-tauri/src/       Rust backend:
+  iroh/              endpoint, connection, and prompt streaming
+  protocol.rs        JSON Lines framing and the response state machine
+  prompt.rs          single-prompt lock, cancellation, and persistence
+  sessions.rs        session and transcript store
+  storage/           atomic files, key, config, and history stores
+  commands.rs        the 15 registered commands and their validation
+  events.rs          prompt, connection, history, and notice events
+  state.rs, lib.rs   application wiring, window, menu, and shutdown
+src-tauri/tests/     Rust unit and integration tests, plus the legacy data fixture
+```
+
+The window is 1180×780 with an 800×600 minimum and the background `#101418`. It stays hidden
+until the page finishes loading. The native title follows the connection state, macOS gets a
+minimal application/edit menu, and other platforms have no application menu. Clipboard writes
+and startup error dialogs are handled by native plugins from Rust.
 
 ## Connect to a server
 
 1. Start Hermes Agent with the `Iroh-channel` plugin enabled (see [Server plugin](#server-plugin))
-   and obtain either the server `NodeTicket` or the server `NodeId`. A ticket is preferred
+   and obtain either the server endpoint ticket or the server `NodeId`. A ticket is preferred
    because it already carries reachable addresses; a bare `NodeId` relies on Iroh discovery.
 2. Start the desktop client and open **Settings** from the sidebar. The **Client NodeId** is
    shown under **Connection** on the settings page. It is stable across restarts and is derived
-   from `userData/client.key`.
+   from `client.key`.
 3. Copy the client `NodeId` and allow it on the server:
 
    ```text
@@ -180,19 +240,19 @@ is still settling.
 
 ### Relay configuration
 
-- **Relay URL empty** — `RelayMode.defaultMode()` (the n0 production relay map).
-- **Relay URL set** — `RelayMode.customFromUrls([relayUrl])` for the *client's* endpoint.
+- **Relay URL empty** — `RelayMode::Default` (the n0 production relay map).
+- **Relay URL set** — `RelayMode::Custom` with that single relay for the *client's* endpoint.
   Use `https://…` or `http://…`.
 - A ticket already contains the server's addresses. A bare `NodeId` is resolved through
   discovery, with the configured relay URL supplied as an address hint.
 
 ## Local data and key backup
 
-Files live under Electron's `app.getPath('userData')`:
+Files live in the same per-user directory used by earlier desktop releases:
 
 | OS | Path |
 | --- | --- |
-| Linux | `~/.config/hermes-iroh-app/` |
+| Linux | `$XDG_CONFIG_HOME/hermes-iroh-app/`, defaulting to `~/.config/hermes-iroh-app/` |
 | macOS | `~/Library/Application Support/hermes-iroh-app/` |
 | Windows | `%APPDATA%\hermes-iroh-app\` |
 
@@ -204,6 +264,12 @@ userData/
     index.json               # active session + session metadata
     <sessionId>.json         # per-session messages
 ```
+
+The Rust backend resolves this directory explicitly and never uses Tauri's default
+application-data path, which differs on Linux. The formats are unchanged, so an upgrade keeps
+the same `NodeId`, settings, sessions, transcripts, statuses, and response metadata, and a
+downgrade to an earlier build remains possible without conversion. Unknown fields in
+`config.json` are preserved when settings are saved again.
 
 **`client.key` is the client identity.** Back it up if the machine is replaced. Deleting or
 losing it creates a new NodeId that must be allowlisted again. If the file exists but is
@@ -217,18 +283,22 @@ original as `*.corrupt-<timestamp>` and the affected session starts empty with a
 
 ## Security model
 
-- The renderer is sandboxed with `contextIsolation: true`, `nodeIntegration: false`, and
-  `sandbox: true`. It has no Node.js APIs, filesystem access, key material, or Iroh objects.
-- Preload exposes one frozen `window.irohChannel` object through `contextBridge`. It contains
-  only the documented operations; there is no generic IPC invoke.
-- Main accepts only a fixed channel allowlist, verifies the sender frame belongs to the
-  application window, and validates every payload with Zod before touching storage, keys, or
-  the network.
-- Only locally packaged renderer content is loaded. New windows are denied, navigation outside
-  the app origin is blocked, and the production CSP disallows remote scripts and connections.
-  Development adds only the Vite HMR origin/WebSocket allowances.
-- The secret key is never logged, serialized over IPC, or written outside `client.key`. File
-  permissions plus full-disk encryption are the local confidentiality boundary.
+- The renderer runs in the operating system webview with no Node.js integration, filesystem
+  access, key material, or Iroh objects. Privileged work happens in the Rust process.
+- The only bridge is one frozen typed object (`src/renderer/src/bridge.ts`) over Tauri
+  `invoke`/`listen`. It contains only the documented operations; there is no generic command
+  surface, and `window.__TAURI__` is not exposed (`withGlobalTauri: false`).
+- The backend registers exactly 15 commands, checks that the caller is the `main` window, and
+  validates every payload and its length before touching keys, configuration, storage, or the
+  network. Invalid requests fail without side effects.
+- Only locally packaged renderer content is loaded. The production CSP disallows remote scripts
+  and connections, navigation outside the application origin is denied, and new windows are
+  denied. Development adds only the Vite origin and HMR WebSocket allowances.
+- Capabilities grant only core window/event access. No filesystem, shell, process, HTTP, or
+  webview-creation permissions are exposed.
+- The secret key is never logged, serialized over the bridge, or written outside `client.key`.
+  File permissions plus full-disk encryption are the local confidentiality boundary.
+- The Iroh endpoint is closed when the application quits, after pending history is flushed.
 
 ## Protocol summary
 
@@ -301,16 +371,18 @@ A successful `done` frame may include `metadata` describing the turn. The server
 | Connection closed before a response | The client was likely rejected. Run `/iroh_allow <client_node_id>` for the NodeId shown on the settings page. |
 | Connection reset / refused | The server or relay dropped the connection. Retry, check the relay URL, and confirm the server is online. |
 | `startup reports an identity error` | `client.key` is unreadable or not 32 bytes. Restore the backup or deliberately delete it to create a new identity. |
-| Missing native module | `@number0/iroh` could not load on this OS/arch, usually macOS Intel. Use a supported platform. |
+| Window does not start on Linux | Install the WebKitGTK 4.1 runtime (`libwebkit2gtk-4.1-0`) and a GTK-compatible desktop session. |
 | Settings will not save | A target is required and the ticket/NodeId must parse. If both fields are filled the ticket wins and the NodeId is dropped. The last valid settings remain active. |
 | `session_busy` after stopping | The server has not released its session slot yet. Wait a moment and send the prompt again; the client lock is already free. |
 | History notice after launch | A history file was invalid; it was preserved as `*.corrupt-*` and that session starts empty. |
+| Installer rejected for size | Every installer must be at most 25 MB. The release workflow fails instead of publishing an oversized asset. |
 
 ## Publishing a release
 
 The release workflow (`.github/workflows/release.yml`) runs on any tag matching `v*`:
 
-1. Bump `version` in `package.json` and commit the change.
+1. Bump `version` in `package.json` and run `npm run tauri:sync` so
+   `src-tauri/tauri.conf.json` matches. Commit both changes.
 2. Create and push a matching tag:
 
    ```bash
@@ -318,10 +390,13 @@ The release workflow (`.github/workflows/release.yml`) runs on any tag matching 
    git push origin v0.2.1
    ```
 
-3. The workflow fails before packaging when the tag does not equal
-   `v$(node -p "require('./package.json').version")`. On success it runs type checking and the
-   test suite, builds Windows x64/arm64, macOS arm64, and Linux x64/arm64 installers, and
-   publishes one release with all eight installers plus `SHA256SUMS.txt`.
+3. The workflow fails before packaging when `npm run tauri:check` finds that the tag,
+   `package.json`, and `src-tauri/tauri.conf.json` disagree. On success it runs type checking,
+   the Vitest suite, the Rust tests, clippy, and rustfmt, builds Windows x64/arm64, macOS arm64,
+   and Linux x64/arm64 bundles on native runners, builds the minimal Linux AppImages with
+   `scripts/build-appimage.sh`, renames every artifact into the release contract, zips the
+   macOS application with `ditto`, and enforces the 25 MB installer budget. It then publishes
+   one release with all eight installers plus `SHA256SUMS.txt`.
 
 For a prerelease, use a semver prerelease suffix; the GitHub Release is marked as a prerelease:
 
@@ -344,8 +419,8 @@ git tag --delete v0.2.1
 ## Manual end-to-end verification
 
 1. Start Hermes Agent with the `Iroh-channel` plugin installed (see [Server plugin](#server-plugin)).
-   Note its ticket or NodeId.
-2. Launch `npm run dev` in this directory. Expected: a window opens with the title
+   Note its endpoint ticket or NodeId.
+2. Launch `npm run tauri dev` in this directory. Expected: a window opens with the title
    `Hermes Iroh App — Disconnected`, no application menu bar, a sidebar with the session list and a
    **Settings** action, and a settings page showing a `Disconnected` status and a non-empty
    client NodeId.
@@ -391,7 +466,8 @@ git tag --delete v0.2.1
     appears. Stop a response mid-stream against a metadata-capable server: expected, the partial
     message is marked interrupted and the composer status keeps its previous values.
 
-Automated checks (`npm test`) cover the same wire contract against a real in-process Iroh
-endpoint with `presetMinimal`: exact prompt bytes, start/delta/done ordering, server errors,
-early close with the allowlist hint, malformed JSON, and prompt-lock release. They skip with a
-diagnostic when the native module is unavailable.
+Automated checks cover the wire contract against a real in-process Iroh endpoint: exact prompt
+bytes, start/delta/done ordering, server errors, early close with the allowlist hint, malformed
+JSON, cancellation, and prompt-lock release. The legacy data fixture verifies that the Rust
+stores read and rewrite files produced by an earlier desktop release without changing the
+client NodeId, sessions, transcripts, statuses, or metadata.

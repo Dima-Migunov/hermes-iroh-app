@@ -7,30 +7,6 @@ import type {
   SessionSummary,
 } from './protocol'
 
-export const IPC = {
-  identityGet: 'identity:get',
-  configGet: 'config:get',
-  configSave: 'config:save',
-  connectionStatus: 'connection:status',
-  connectionConnect: 'connection:connect',
-  connectionDisconnect: 'connection:disconnect',
-  sessionsList: 'sessions:list',
-  sessionsCreate: 'sessions:create',
-  sessionsActivate: 'sessions:activate',
-  sessionsGet: 'sessions:get',
-  sessionsGetActive: 'sessions:get-active',
-  promptSend: 'prompt:send',
-  promptCancel: 'prompt:cancel',
-  clipboardWrite: 'clipboard:write',
-  promptEvent: 'prompt:event',
-  connectionStatusChanged: 'connection:status-changed',
-  historyChanged: 'history:changed',
-  notice: 'app:notice',
-  noticesGet: 'app:notices',
-} as const
-
-export type IpcChannel = (typeof IPC)[keyof typeof IPC]
-
 export interface PromptSubmission {
   sessionId: string
   text: string

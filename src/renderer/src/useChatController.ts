@@ -5,6 +5,7 @@ import type {
   ResponseMetadata,
   StoredMessage,
 } from '@shared/protocol'
+import { bridge } from './bridge'
 import {
   chatReducer,
   initialChatState,
@@ -42,17 +43,7 @@ export function useChatController(): ChatController {
   stateRef.current = state
 
   useEffect(() => {
-    const api = window.irohChannel
-    if (!api) {
-      dispatch({
-        type: 'notice/add',
-        notice: {
-          level: 'warning',
-          message: 'The desktop bridge is unavailable. Restart the application.',
-        },
-      })
-      return
-    }
+    const api = bridge
 
     let cancelled = false
     let frameId: number | null = null
@@ -178,9 +169,9 @@ export function useChatController(): ChatController {
   }, [])
 
   const sendPrompt = useCallback(async (text: string): Promise<boolean> => {
-    const api = window.irohChannel
+    const api = bridge
     const current = stateRef.current
-    if (!api || !current.activeSessionId || text.trim().length === 0 || current.generating) {
+    if (!current.activeSessionId || text.trim().length === 0 || current.generating) {
       return false
     }
 
@@ -210,8 +201,8 @@ export function useChatController(): ChatController {
   }, [])
 
   const cancelPrompt = useCallback(async (): Promise<void> => {
-    const api = window.irohChannel
-    if (!api || !stateRef.current.generating) return
+    const api = bridge
+    if (!stateRef.current.generating) return
     try {
       await api.cancelPrompt()
     } catch (error) {
@@ -220,8 +211,8 @@ export function useChatController(): ChatController {
   }, [])
 
   const createSession = useCallback(async (): Promise<void> => {
-    const api = window.irohChannel
-    if (!api || stateRef.current.generating) return
+    const api = bridge
+    if (stateRef.current.generating) return
     try {
       const session = await api.createSession()
       dispatch({ type: 'session/created', session })
@@ -231,9 +222,9 @@ export function useChatController(): ChatController {
   }, [])
 
   const activateSession = useCallback(async (id: string): Promise<void> => {
-    const api = window.irohChannel
+    const api = bridge
     const current = stateRef.current
-    if (!api || current.generating || current.activeSessionId === id) return
+    if (current.generating || current.activeSessionId === id) return
     try {
       const snapshot = await api.activateSession(id)
       dispatch({ type: 'session/activated', snapshot })
@@ -243,9 +234,7 @@ export function useChatController(): ChatController {
   }, [])
 
   const saveAndConnect = useCallback(async (config: ClientConfig): Promise<ClientConfig> => {
-    const api = window.irohChannel
-    if (!api) throw new Error('The desktop bridge is unavailable.')
-
+    const api = bridge
     const saved = await api.saveConfig(config)
     dispatch({ type: 'config/saved', config: saved })
     const status = await api.connect()
@@ -254,8 +243,7 @@ export function useChatController(): ChatController {
   }, [])
 
   const copyText = useCallback(async (text: string): Promise<void> => {
-    const api = window.irohChannel
-    if (!api) return
+    const api = bridge
     try {
       await api.copyText(text)
     } catch (error) {

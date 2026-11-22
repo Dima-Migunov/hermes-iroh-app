@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "activeSessionId": "session-alpha",
+  "sessions": [
+    {
+      "id": "session-alpha",
+      "title": "Legacy transcript",
+      "createdAt": "2026-01-02T03:04:05.000Z",
+      "updatedAt": "2026-01-02T03:05:06.000Z"
+    },
+    {
+      "id": "session-beta",
+      "title": "Interrupted chat",
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "updatedAt": "2026-01-01T00:01:00.000Z"
+    }
+  ]
+}

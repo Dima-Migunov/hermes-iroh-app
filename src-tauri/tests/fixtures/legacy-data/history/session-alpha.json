@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "sessionId": "session-alpha",
+  "messages": [
+    {
+      "id": "message-user",
+      "role": "user",
+      "content": "hello from an earlier build",
+      "createdAt": "2026-01-02T03:04:06.000Z",
+      "status": "complete"
+    },
+    {
+      "id": "message-assistant",
+      "role": "assistant",
+      "content": "Hello from the old build",
+      "createdAt": "2026-01-02T03:04:07.000Z",
+      "status": "complete",
+      "metadata": {
+        "schema": 1,
+        "generated_at": "2026-01-02T03:05:00.000Z",
+        "latency_ms": 42,
+        "model": "gpt-5.1",
+        "provider": "openai",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 3,
+          "total_tokens": 13
+        },
+        "session_usage": {
+          "input_tokens": 10,
+          "output_tokens": 3,
+          "total_tokens": 13,
+          "api_calls": 1,
+          "estimated_cost_usd": 0.01,
+          "context_percent": 1.5
+        },
+        "balance": {
+          "remaining_usd": 12.5,
+          "paid_access": true,
+          "as_of_ms": 1767323100000
+        }
+      }
+    }
+  ]
+}
