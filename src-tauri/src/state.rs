@@ -20,6 +20,7 @@ pub struct AppState {
     pub notices: Vec<String>,
     pub app: AppHandle,
     pub shutdown_started: AtomicBool,
+    pub lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {

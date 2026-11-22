@@ -15,6 +15,16 @@ pub struct ClientIdentity {
     pub secret_key: SecretKey,
 }
 
+impl ClientIdentity {
+    pub fn ephemeral() -> Self {
+        let secret_key = SecretKey::generate();
+        Self {
+            node_id: secret_key.public().to_string(),
+            secret_key,
+        }
+    }
+}
+
 pub struct KeyStore {
     file_path: PathBuf,
 }
@@ -145,6 +155,15 @@ mod tests {
         let error = store.load().expect_err("unreadable");
         assert_eq!(error.code, crate::errors::ErrorCode::Identity);
         assert!(fs::metadata(&file_path).expect("metadata").is_dir());
+    }
+
+    #[test]
+    fn creates_distinct_ephemeral_identities_without_touching_disk() {
+        let first = ClientIdentity::ephemeral();
+        let second = ClientIdentity::ephemeral();
+
+        assert_ne!(first.node_id, second.node_id);
+        assert_eq!(first.secret_key.to_bytes().len(), KEY_BYTES);
     }
 
     #[test]

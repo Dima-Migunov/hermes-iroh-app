@@ -28,6 +28,7 @@ async function createBundleFixture() {
     'appimage/hermes-iroh-app_0.7.0_aarch64.AppImage': 'appimage-arm64',
     'deb/hermes-iroh-app_0.7.0_amd64.deb': 'deb-x64',
     'deb/hermes-iroh-app_0.7.0_arm64.deb': 'deb-arm64',
+    'apk/hermes-iroh-app-arm64-release.apk': 'apk-arm64',
   }
 
   for (const [relative, contents] of Object.entries(files)) {
@@ -47,7 +48,7 @@ afterEach(async () => {
 })
 
 describe('release assets', () => {
-  it('renames a Tauri output fixture into the eight published names', async () => {
+  it('renames a Tauri output fixture into the nine published names', async () => {
     const { root, bundle } = await createBundleFixture()
     const output = join(root, 'release')
 
@@ -58,7 +59,7 @@ describe('release assets', () => {
       ditto: async (_appPath, outputPath) => writeFile(outputPath, 'zip'),
     })
 
-    expect(assets).toHaveLength(8)
+    expect(assets).toHaveLength(9)
     expect((await readdir(output)).sort()).toEqual(
       [
         'hermes-iroh-app-0.7.0-win-x64.exe',
@@ -69,8 +70,29 @@ describe('release assets', () => {
         'hermes-iroh-app-0.7.0-linux-arm64.AppImage',
         'hermes-iroh-app-0.7.0-linux-amd64.deb',
         'hermes-iroh-app-0.7.0-linux-arm64.deb',
+        'hermes-iroh-app-0.7.0-android-arm64.apk',
       ].sort(),
     )
+  })
+
+  it('keeps one APK when several Android outputs are collected', async () => {
+    const root = await temporaryDirectory()
+    const first = join(root, 'first')
+    const second = join(root, 'second')
+    await mkdir(first, { recursive: true })
+    await mkdir(second, { recursive: true })
+    await writeFile(join(first, 'app-arm64-release.apk'), 'first')
+    await writeFile(join(second, 'app-universal-release.apk'), 'second')
+
+    const output = join(root, 'release')
+    const assets = await collectAssets({
+      inputDirs: [first, second],
+      outputDir: output,
+      version: '0.7.0',
+    })
+
+    expect(assets).toHaveLength(1)
+    expect(await readdir(output)).toEqual(['hermes-iroh-app-0.7.0-android-arm64.apk'])
   })
 
   it('accepts installers at the size budget', async () => {
@@ -90,6 +112,15 @@ describe('release assets', () => {
     const installer = join(directory, 'oversized.exe')
     await writeFile(installer, 'x')
     await truncate(installer, MAX_INSTALLER_BYTES + 1)
+
+    await expect(checkInstallerSizes(directory)).rejects.toThrow(/exceeding the/)
+  })
+
+  it('applies the size budget to the Android APK', async () => {
+    const directory = await temporaryDirectory()
+    const apk = join(directory, 'hermes-iroh-app-0.7.0-android-arm64.apk')
+    await writeFile(apk, 'x')
+    await truncate(apk, MAX_INSTALLER_BYTES + 1)
 
     await expect(checkInstallerSizes(directory)).rejects.toThrow(/exceeding the/)
   })

@@ -16,8 +16,8 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 26.13.1
           cache: npm
@@ -78,8 +78,8 @@ jobs:
             arch: arm64
             bundles: deb
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 26.13.1
           cache: npm
@@ -137,15 +137,112 @@ jobs:
       - name: Enforce the installer size budget
         run: node scripts/check-installer-size.mjs --directory release
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: release/*
           if-no-files-found: error
           retention-days: 7
 
+  android:
+    needs: verify
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26.13.1
+          cache: npm
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+      - name: Install the Android SDK, build tools, and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "platforms;android-37.2" \
+            "build-tools;37.0.0" \
+            "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: android-arm64
+      - run: npm ci
+      - run: npm run tauri:sync
+      - run: npm run tauri:check
+      - name: Require the Android signing material
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required secret $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+      - name: Configure the release keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          cat > src-tauri/gen/android/key.properties <<EOF
+          storeFile=$keystore
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+      - name: Build the Android APK
+        run: npx tauri android build --apk --target aarch64
+      - name: Verify the APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)
+          test -n "$apk"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$apk"
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          node scripts/collect-release-assets.mjs \
+            --input src-tauri/gen/android/app/build/outputs/apk \
+            --output release \
+            --version "$version"
+      - name: Enforce the installer size budget
+        run: node scripts/check-installer-size.mjs --directory release
+      - name: Upload the Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-arm64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
   release:
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -154,14 +251,14 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout tagged commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 26.13.1
       - name: Download installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
@@ -182,6 +279,7 @@ jobs:
           check '*.zip' 1
           check '*.AppImage' 2
           check '*.deb' 2
+          check '*.apk' 1
       - name: Enforce the installer size budget
         run: node scripts/check-installer-size.mjs --directory release
       - name: Generate checksums
@@ -190,7 +288,7 @@ jobs:
           set -euo pipefail
           cd release
           shopt -s nullglob
-          files=(*.exe *.dmg *.zip *.AppImage *.deb)
+          files=(*.exe *.dmg *.zip *.AppImage *.deb *.apk)
           sha256sum "${files[@]}" > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
       - name: Generate release notes
@@ -226,7 +324,7 @@ jobs:
             esac
             gh release create "$tag" --draft --verify-tag --notes-file release/RELEASE_NOTES.md "${prerelease_args[@]}"
           fi
-          gh release upload "$tag" release/*.exe release/*.dmg release/*.zip release/*.AppImage release/*.deb release/SHA256SUMS.txt --clobber
+          gh release upload "$tag" release/*.exe release/*.dmg release/*.zip release/*.AppImage release/*.deb release/*.apk release/SHA256SUMS.txt --clobber
           if [[ "$tag" == *-* ]]; then
             gh release edit "$tag" --draft=false --notes-file release/RELEASE_NOTES.md --prerelease
           else

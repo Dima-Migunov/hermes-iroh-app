@@ -9,10 +9,13 @@ pub enum Platform {
     Linux,
     MacOs,
     Windows,
+    Android,
 }
 
 pub fn current_platform() -> Platform {
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "android") {
+        Platform::Android
+    } else if cfg!(target_os = "windows") {
         Platform::Windows
     } else if cfg!(target_os = "macos") {
         Platform::MacOs
@@ -62,7 +65,14 @@ pub fn resolve_data_dir(
             })?;
             Ok(appdata.join(APPLICATION_DIRECTORY))
         }
+        Platform::Android => Err(AppError::configuration(
+            "The Android data directory must be resolved from the application context.",
+        )),
     }
+}
+
+pub fn resolve_android_data_dir(app_data_dir: impl Into<PathBuf>) -> PathBuf {
+    app_data_dir.into().join(APPLICATION_DIRECTORY)
 }
 
 pub fn client_key_path(data_dir: &Path) -> PathBuf {
@@ -155,5 +165,36 @@ mod tests {
     fn reports_a_missing_home_directory() {
         let error = resolve_data_dir(Platform::Linux, None, None, None).expect_err("missing home");
         assert_eq!(error.code, crate::errors::ErrorCode::Configuration);
+    }
+
+    #[test]
+    fn android_uses_the_application_private_directory() {
+        let resolved =
+            resolve_android_data_dir(path("/data/user/0/com.number0.hermesirohapp/files"));
+
+        assert_eq!(
+            resolved,
+            path("/data/user/0/com.number0.hermesirohapp/files/hermes-iroh-app")
+        );
+    }
+
+    #[test]
+    fn android_does_not_fall_back_to_environment_directories() {
+        let error = resolve_data_dir(
+            Platform::Android,
+            Some(path("/custom/config")),
+            Some(path("/home/user")),
+            Some(path("C:/Users/user/AppData/Roaming")),
+        )
+        .expect_err("android needs the app context");
+
+        assert_eq!(error.code, crate::errors::ErrorCode::Configuration);
+        assert!(error.message.contains("application context"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn desktop_platforms_are_not_android() {
+        assert_ne!(current_platform(), Platform::Android);
     }
 }

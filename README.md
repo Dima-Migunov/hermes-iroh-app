@@ -1,14 +1,17 @@
 # Hermes Iroh App
 
-A standalone desktop client for the Hermes Agent
+A standalone desktop and Android client for the Hermes Agent
 [`Iroh-channel`](https://github.com/Dima-Migunov/hermes-iroh-channel) plugin. It connects
 directly to the server over Iroh using ALPN `iroh-channel/1`, keeps its own stable identity, and
 streams agent responses into a local chat UI. Hermes Agent, Python, and the server runtime do
 not need to be installed on the client machine.
 
-The desktop shell is Tauri v2. The UI is a React 19 + Vite renderer rendered by the operating
-system webview, and the privileged backend is a Rust process that links the `iroh` crate
-directly. No browser engine or Node.js runtime is bundled in the installers.
+The desktop and Android shells share Tauri v2 and one React 19 + Vite renderer. The UI is
+rendered by the operating system webview (WebKitGTK, WebView2, WKWebView, or the Android system
+WebView), and the privileged backend is a Rust process that links the `iroh` crate directly. No
+browser engine or Node.js runtime is bundled in the installers.
+
+<img src="docs/screenshot.png" alt="Hermes Iroh App" width="900" style="width: 900px; max-width: 100%; height: auto;">
 
 ## Prerequisites
 
@@ -17,10 +20,26 @@ Building from source requires:
 - **Node.js ≥ 26.13.1** and npm.
 - **Rust stable** (1.91 or newer) with `cargo`.
 - On Linux, the WebKitGTK 4.1 development package and the usual Tauri build dependencies.
+- For Android builds, **JDK 21**, the Android SDK with platform 37.2, build-tools 37.0.0,
+  NDK 30.0.16248370, and the `aarch64-linux-android` Rust target.
 - A running Hermes Agent server with the
   [`Iroh-channel` plugin](https://github.com/Dima-Migunov/hermes-iroh-channel) enabled, plus
   either its endpoint ticket or its `NodeId`.
 - A client `NodeId` added to the server allowlist with `/iroh_allow <client_node_id>`.
+
+`container/Dockerfile` provides the complete Linux and Android build toolchain, including Node,
+Rust with the Android target, JDK 21, and the Android SDK/NDK:
+
+```bash
+docker build -t hermes-iroh-builder container
+mkdir -p .cache/home .cache/cargo .cache/target .cache/gradle
+docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" \
+  -e HOME=/work/.cache/home \
+  -e CARGO_HOME=/work/.cache/cargo \
+  -e CARGO_TARGET_DIR=/work/.cache/target \
+  -e GRADLE_USER_HOME=/work/.cache/gradle \
+  hermes-iroh-builder npm test
+```
 
 On Debian/Ubuntu, install the Linux build dependencies with:
 
@@ -38,6 +57,7 @@ is not bundled, which keeps the installers small. Supported targets are:
 | Windows | x64, arm64 | NSIS installer; uses the bundled WebView2 runtime |
 | macOS | arm64 only | No Intel (x64) build is published |
 | Linux | x64, arm64 | WebKitGTK 4.1 required; AppImage and deb |
+| Android | arm64 only | APK for Android 7.0 (API 24)+; uses the system WebView |
 
 ## Server plugin
 
@@ -75,21 +95,23 @@ asset that matches your operating system and architecture.
 | Windows | x64, arm64 | NSIS installer (`.exe`) |
 | macOS | arm64 (Apple Silicon) | `.dmg` disk image and `.zip` archive |
 | Linux | x64, arm64 | `.AppImage` and `.deb` |
+| Android | arm64 | `.apk` for Android 7.0 (API 24) and newer |
 
 Every installer is at most 25 MB. Asset names follow
-`hermes-iroh-app-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`, `mac`, or `linux`.
-Linux assets use the native package tokens: `x86_64` for AppImage and `amd64` for deb. For
-version `0.7.0` the release contains:
+`hermes-iroh-app-<version>-<os>-<arch>.<ext>`, where `<os>` is `win`, `mac`, `linux`, or
+`android`. Linux assets use the native package tokens: `x86_64` for AppImage and `amd64` for
+deb. For version `0.8.0` the release contains:
 
 ```text
-hermes-iroh-app-0.7.0-win-x64.exe
-hermes-iroh-app-0.7.0-win-arm64.exe
-hermes-iroh-app-0.7.0-mac-arm64.dmg
-hermes-iroh-app-0.7.0-mac-arm64.zip
-hermes-iroh-app-0.7.0-linux-x86_64.AppImage
-hermes-iroh-app-0.7.0-linux-arm64.AppImage
-hermes-iroh-app-0.7.0-linux-amd64.deb
-hermes-iroh-app-0.7.0-linux-arm64.deb
+hermes-iroh-app-0.8.0-win-x64.exe
+hermes-iroh-app-0.8.0-win-arm64.exe
+hermes-iroh-app-0.8.0-mac-arm64.dmg
+hermes-iroh-app-0.8.0-mac-arm64.zip
+hermes-iroh-app-0.8.0-linux-x86_64.AppImage
+hermes-iroh-app-0.8.0-linux-arm64.AppImage
+hermes-iroh-app-0.8.0-linux-amd64.deb
+hermes-iroh-app-0.8.0-linux-arm64.deb
+hermes-iroh-app-0.8.0-android-arm64.apk
 SHA256SUMS.txt
 ```
 
@@ -132,6 +154,18 @@ its WebKitGTK 4.1 dependency:
 sudo dpkg -i hermes-iroh-app-<version>-linux-<arch>.deb
 ```
 
+**Android.** The APK is self-signed by the project and is not distributed through Google Play
+or any other app store. Download it on the device, allow installation from unknown sources for
+the browser or file manager that opens it, and open the file. To install over USB instead:
+
+```bash
+adb install hermes-iroh-app-<version>-android-arm64.apk
+```
+
+Only 64-bit ARM (`arm64-v8a`) devices running Android 7.0 (API level 24) or newer are
+supported. No 32-bit ARM or x86 Android build is published. The application renders through the
+system WebView supplied by the device, so no separate browser runtime is installed.
+
 ## Build and run from source
 
 To run from source instead of using a downloaded build:
@@ -145,6 +179,25 @@ npm test           # Vitest renderer and release-tooling tests
 npm run build      # compile the renderer into out/renderer
 npm run package    # build installers for the current platform into src-tauri/target
 ```
+
+Android uses the same renderer and Rust backend:
+
+```bash
+npx tauri android init                  # regenerate the committed Gradle project
+npx tauri android build --apk --target aarch64
+npx tauri android dev                   # run on a connected device or emulator
+```
+
+`android init` overwrites `src-tauri/gen/android`, including the committed signing, ABI, and
+icon customizations. Run it only when intentionally regenerating the project and diff the
+result before committing.
+
+`src-tauri/gen/android` is committed and CI never regenerates it, so signing configuration and
+manifest changes stay stable. For a local release build, create
+`src-tauri/gen/android/key.properties` with `storeFile`, `storePassword`, `keyAlias`, and
+`keyPassword`; without it the release APK falls back to the standard Android debug keystore
+(`~/.android/debug.keystore`, created by a debug build) for local device testing only. Release
+builds pass `aarch64` and package only the `arm64-v8a` ABI.
 
 The Rust backend is checked and tested separately:
 
@@ -184,13 +237,22 @@ src-tauri/src/       Rust backend:
   commands.rs        the 15 registered commands and their validation
   events.rs          prompt, connection, history, and notice events
   state.rs, lib.rs   application wiring, window, menu, and shutdown
+src-tauri/gen/android/
+                     Generated Gradle project, committed with signing and ABI config
 src-tauri/tests/     Rust unit and integration tests, plus the legacy data fixture
 ```
 
-The window is 1180×780 with an 800×600 minimum and the background `#101418`. It stays hidden
-until the page finishes loading. The native title follows the connection state, macOS gets a
-minimal application/edit menu, and other platforms have no application menu. Clipboard writes
-and startup error dialogs are handled by native plugins from Rust.
+On desktop, the window is 1180×780 with an 800×600 minimum and the background `#101418`. It
+stays hidden until the page finishes loading. The native title follows the connection state,
+macOS gets a minimal application/edit menu, and other platforms have no application menu.
+Clipboard writes and startup error dialogs are handled by native plugins from Rust.
+
+On Android the app runs in the platform's single window. It has no window title or application
+menu, and the connection state is shown only in the sidebar and settings page. `run()` carries
+the mobile entry point and selects desktop or mobile setup, window creation, menu, title, fatal
+startup handling, and exit handling at compile time. The mobile window keeps the navigation and
+new-window denial handlers but omits the desktop size, minimum size, hidden-until-loaded,
+background-color, and page-load show options.
 
 ## Connect to a server
 
@@ -248,13 +310,14 @@ is still settling.
 
 ## Local data and key backup
 
-Files live in the same per-user directory used by earlier desktop releases:
+Files live in these per-user or app-private directories:
 
 | OS | Path |
 | --- | --- |
 | Linux | `$XDG_CONFIG_HOME/hermes-iroh-app/`, defaulting to `~/.config/hermes-iroh-app/` |
 | macOS | `~/Library/Application Support/hermes-iroh-app/` |
 | Windows | `%APPDATA%\hermes-iroh-app\` |
+| Android | The app-private data directory, `<app data>/hermes-iroh-app/` (for example `/data/user/0/com.number0.hermesirohapp/files/hermes-iroh-app/`) |
 
 ```text
 userData/
@@ -265,11 +328,14 @@ userData/
     <sessionId>.json         # per-session messages
 ```
 
-The Rust backend resolves this directory explicitly and never uses Tauri's default
-application-data path, which differs on Linux. The formats are unchanged, so an upgrade keeps
-the same `NodeId`, settings, sessions, transcripts, statuses, and response metadata, and a
-downgrade to an earlier build remains possible without conversion. Unknown fields in
-`config.json` are preserved when settings are saved again.
+The Rust backend resolves the desktop directory explicitly and never uses Tauri's default
+application-data path, which differs on Linux. On Android it resolves the storage root from the
+application's private data directory, without `HOME`, `XDG_CONFIG_HOME`, `APPDATA`, storage
+permissions, or runtime permission prompts. The file names, relative layout, and JSON formats
+are identical on every platform, so an upgrade keeps the same `NodeId`, settings, sessions,
+transcripts, statuses, and response metadata, and a downgrade to an earlier build remains
+possible without conversion. Unknown fields in `config.json` are preserved when settings are
+saved again.
 
 **`client.key` is the client identity.** Back it up if the machine is replaced. Deleting or
 losing it creates a new NodeId that must be allowlisted again. If the file exists but is
@@ -299,6 +365,10 @@ original as `*.corrupt-<timestamp>` and the affected session starts empty with a
 - The secret key is never logged, serialized over the bridge, or written outside `client.key`.
   File permissions plus full-disk encryption are the local confidentiality boundary.
 - The Iroh endpoint is closed when the application quits, after pending history is flushed.
+- On Android the app requests only the Internet permission, renders through the system WebView,
+  and keeps identity and history in app-private storage. Suspending the app cancels an in-flight
+  prompt, flushes history, and closes the Iroh endpoint; no foreground service runs in the
+  background.
 
 ## Protocol summary
 
@@ -376,6 +446,10 @@ A successful `done` frame may include `metadata` describing the turn. The server
 | `session_busy` after stopping | The server has not released its session slot yet. Wait a moment and send the prompt again; the client lock is already free. |
 | History notice after launch | A history file was invalid; it was preserved as `*.corrupt-*` and that session starts empty. |
 | Installer rejected for size | Every installer must be at most 25 MB. The release workflow fails instead of publishing an oversized asset. |
+| No Android asset for the device | Only an arm64 APK for Android 7.0 (API 24) and newer is published. 32-bit ARM and x86 devices are not supported. |
+| Android blocks the APK install | Allow installation from unknown sources for the browser or file manager that opens the APK, then open it again. |
+| Android renders a blank or outdated UI | Update the system WebView from the Play Store or the device's app store; the app does not bundle a browser engine. |
+| Android stops a response when backgrounded | The app closes its Iroh endpoint while suspended and saves the partial answer as interrupted. Return to the app to reconnect. |
 
 ## Publishing a release
 
@@ -393,10 +467,27 @@ The release workflow (`.github/workflows/release.yml`) runs on any tag matching 
 3. The workflow fails before packaging when `npm run tauri:check` finds that the tag,
    `package.json`, and `src-tauri/tauri.conf.json` disagree. On success it runs type checking,
    the Vitest suite, the Rust tests, clippy, and rustfmt, builds Windows x64/arm64, macOS arm64,
-   and Linux x64/arm64 bundles on native runners, builds the minimal Linux AppImages with
+   Linux x64/arm64, and the Android arm64 APK, builds the minimal Linux AppImages with
    `scripts/build-appimage.sh`, renames every artifact into the release contract, zips the
    macOS application with `ditto`, and enforces the 25 MB installer budget. It then publishes
-   one release with all eight installers plus `SHA256SUMS.txt`.
+   one release with all nine installers plus `SHA256SUMS.txt`.
+
+### Android signing secrets
+
+The Android job requires four repository secrets and fails without them, so a release never
+contains an unsigned or debug-signed APK:
+
+```bash
+base64 -w0 release.keystore | gh secret set ANDROID_KEYSTORE_BASE64
+gh secret set ANDROID_KEYSTORE_PASSWORD
+gh secret set ANDROID_KEY_ALIAS
+gh secret set ANDROID_KEY_PASSWORD
+```
+
+The APK is self-signed by the project and is not distributed through an app store. **Back up the
+release keystore and its passwords like `client.key`.** An installed APK can only be updated by
+an APK signed with the same key; if the keystore is lost, users must uninstall the app and
+allowlist the new client `NodeId` after reinstalling.
 
 For a prerelease, use a semver prerelease suffix; the GitHub Release is marked as a prerelease:
 
@@ -449,22 +540,52 @@ git tag --delete v0.2.1
     page controls, the session list, message copy buttons, and the composer. Expected: every
     control is reachable, focus is visible, and the connection state is conveyed by text in the
     settings status indicator and the window title as well as color.
-12. Start a long response, then choose the stop button; repeat with `Escape`. Expected: the
+12. Collapse the sidebar with the toggle, then expand it. Expected: the rail keeps the toggle,
+    status, and **Settings** reachable with the keyboard and removes session entries from the
+    accessibility tree; the toggle's accessible name changes between `Collapse sidebar` and
+    `Expand sidebar`. At 360 px and 720 px widths the sidebar starts as a drawer over a backdrop,
+    and selecting a session or the backdrop closes it. At 1180 px it starts expanded.
+13. Start a long response, then choose the stop button; repeat with `Escape`. Expected: the
     primary action shows the square stop icon while generating, the partial answer stays visible and
     is marked interrupted, no error banner appears, and another prompt can be sent immediately.
     If the server briefly answers `session_busy`, retrying after a moment succeeds.
-13. With `Iroh-channel` plugin 1.2.0 or newer running on the server, send a prompt. Expected:
+14. With `Iroh-channel` plugin 1.2.0 or newer running on the server, send a prompt. Expected:
     small right-aligned text under the message field shows the model, compact context, and
     estimated cost from the latest completed response, for example
     `Qwen/Qwen3.7-Flash 217.4K / 1M (22%) $0.00`. The completed message itself shows no metadata
     text, and absent values are omitted rather than shown as `null`, `0`, or a dash.
-14. Restart the desktop app and reopen the session. Expected: the composer status shows the
+15. Restart the desktop app and reopen the session. Expected: the composer status shows the
     restored values. Switch to another session and back: expected, the status follows the active
     session and is absent when that session has no completed metadata.
-15. Connect to a server that sends a bare `{"type":"done"}` (an older plugin or no available
+16. Connect to a server that sends a bare `{"type":"done"}` (an older plugin or no available
     metadata). Expected: the response completes normally, no composer status appears, and no error
     appears. Stop a response mid-stream against a metadata-capable server: expected, the partial
     message is marked interrupted and the composer status keeps its previous values.
+
+### Android end-to-end checklist
+
+1. Install the signed APK on an arm64 device or emulator with API level 24 or newer:
+   `adb install hermes-iroh-app-<version>-android-arm64.apk`.
+2. Launch the app. Expected: it opens directly into the chat with the sidebar in its rail, a
+   session list when expanded, and the composer visible; there is no window title or menu.
+3. Open **Settings**, copy the client `NodeId`, and run `/iroh_allow <client_node_id>` on the
+   server.
+4. Connect once with an endpoint ticket and once with a bare server `NodeId`. Expected: the
+   sidebar and settings status move from `Connecting…` to `Connected`.
+5. Send a prompt and stop it mid-stream. Expected: the partial answer stays visible and is marked
+   interrupted, and another prompt can be sent.
+6. Background the app mid-response, then return. Expected: the partial answer is saved as
+   interrupted while suspended, and the app reconnects automatically when a target is configured.
+7. Rotate the device, open the on-screen keyboard, and expand and collapse the sidebar. Expected:
+   the composer stays above the keyboard and system bars, and the drawer closes on selection or
+   backdrop activation.
+8. Force-stop and relaunch. Expected: the same client `NodeId` and session history are restored.
+9. Corrupt `client.key` and the history directory with `adb shell run-as
+   com.number0.hermesirohapp`. Expected: the app stays open, shows a dismissible notice, and does
+   not overwrite the key.
+10. Verify the merged manifest with
+    `aapt dump permissions hermes-iroh-app-<version>-android-arm64.apk`. Expected: only
+    `android.permission.INTERNET`, with no storage, location, or foreground-service permission.
 
 Automated checks cover the wire contract against a real in-process Iroh endpoint: exact prompt
 bytes, start/delta/done ordering, server errors, early close with the allowlist hint, malformed

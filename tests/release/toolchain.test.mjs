@@ -21,7 +21,20 @@ describe('toolchain version policy', () => {
     const nodeVersions = [...workflow.matchAll(/node-version:\s*(\S+)/g)].map(
       (match) => match[1],
     )
-    expect(nodeVersions).toEqual(['26.13.1', '26.13.1', '26.13.1'])
+    expect(nodeVersions).toEqual(['26.13.1', '26.13.1', '26.13.1', '26.13.1'])
+  })
+
+  it('uses the latest stable Android toolchain in the Android job', async () => {
+    const workflow = await text('.github/workflows/release.yml')
+
+    expect(workflow).toContain('java-version: "21"')
+    expect(workflow).toContain('targets: aarch64-linux-android')
+    expect(workflow).toContain('platforms;android-37.0')
+    expect(workflow).toContain('platforms;android-37.2')
+    expect(workflow).toContain('build-tools;37.0.0')
+    expect(workflow).toContain('ndk;30.0.16248370')
+    expect(workflow).toContain('tauri android build --apk --target aarch64')
+    expect(workflow).toContain('apksigner" verify --print-certs')
   })
 
   it('pins the latest stable iroh in the manifest and lockfile', async () => {

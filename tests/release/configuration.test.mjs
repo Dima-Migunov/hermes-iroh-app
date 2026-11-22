@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 
 const root = join(import.meta.dirname, '..', '..')
 const configPath = join(root, 'src-tauri/tauri.conf.json')
+const androidConfigPath = join(root, 'src-tauri/tauri.android.conf.json')
 const capabilityPath = join(root, 'src-tauri/capabilities/default.json')
 
 async function loadJson(path) {
@@ -62,5 +63,18 @@ describe('desktop configuration contract', () => {
     expect(config.build.devUrl).toBe('http://localhost:1420')
     expect(config.build.beforeDevCommand).toBe('npm run dev')
     expect(config.build.beforeBuildCommand).toContain('npm run tauri:sync')
+  })
+})
+
+describe('android configuration contract', () => {
+  it('overrides the identifier with a hyphen-free package name', async () => {
+    const config = await loadJson(androidConfigPath)
+    expect(config.identifier).toBe('com.number0.hermesirohapp')
+    expect(config.identifier).not.toContain('-')
+  })
+
+  it('supports Android 7.0 and newer', async () => {
+    const config = await loadJson(androidConfigPath)
+    expect(config.bundle.android.minSdkVersion).toBe(24)
   })
 })

@@ -4,7 +4,7 @@ import { basename, join } from 'node:path'
 
 export const MAX_INSTALLER_BYTES = 25_000_000
 
-const INSTALLER_PATTERN = /\.(exe|dmg|zip|AppImage|deb)$/
+const INSTALLER_PATTERN = /\.(exe|dmg|zip|AppImage|deb|apk)$/
 
 export function publishedName({ kind, version, arch }) {
   if (kind === 'exe') {
@@ -16,13 +16,16 @@ export function publishedName({ kind, version, arch }) {
   if (kind === 'zip') {
     return `hermes-iroh-app-${version}-mac-arm64.zip`
   }
+  if (kind === 'apk') {
+    return `hermes-iroh-app-${version}-android-arm64.apk`
+  }
 
   const linuxArch = arch === 'arm64' ? 'arm64' : kind === 'AppImage' ? 'x86_64' : 'amd64'
   return `hermes-iroh-app-${version}-linux-${linuxArch}.${kind}`
 }
 
 function archFromName(name, kind) {
-  if (kind === 'dmg' || kind === 'zip') return 'arm64'
+  if (kind === 'dmg' || kind === 'zip' || kind === 'apk') return 'arm64'
 
   const normalized = name.toLowerCase()
   if (normalized.includes('arm64') || normalized.includes('aarch64')) return 'arm64'
@@ -64,6 +67,7 @@ function installerKind(name) {
   if (name.endsWith('.zip')) return 'zip'
   if (name.endsWith('.AppImage')) return 'AppImage'
   if (name.endsWith('.deb')) return 'deb'
+  if (name.endsWith('.apk')) return 'apk'
   return null
 }
 
