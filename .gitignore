@@ -35,6 +35,8 @@ pnpm-debug.log*
 client.key
 server.key
 *.iroh-key
+# Deterministic, test-only key used by the legacy compatibility fixture.
+!src-tauri/tests/fixtures/legacy-data/client.key
 
 # OS / editor cruft
 .DS_Store
