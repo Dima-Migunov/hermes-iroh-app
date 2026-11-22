@@ -60,10 +60,24 @@ export function Composer({ disabled, generating, metadata, onSend, onStop }: Com
               : 'primary-button composer-send-button'
           }
           onClick={generating ? onStop : undefined}
+          onMouseDown={(event) => event.preventDefault()}
           aria-label={generating ? 'Stop' : 'Send'}
           title={generating ? 'Stop' : 'Send'}
         >
-          {generating ? '■' : '↑'}
+          {generating ? (
+            <svg
+              className="composer-stop-icon"
+              viewBox="0 0 14 14"
+              width="14"
+              height="14"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <rect x="1" y="1" width="12" height="12" rx="1.5" fill="currentColor" />
+            </svg>
+          ) : (
+            '↑'
+          )}
         </button>
       </div>
       <div className="composer-actions">

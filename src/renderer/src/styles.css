@@ -68,11 +68,32 @@ textarea {
   justify-content: center;
 }
 
+.brand-banner-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 300px;
+}
+
 .brand-banner {
   display: block;
   width: 100%;
-  max-width: 300px;
   height: auto;
+}
+
+.brand-version {
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  transform: translateY(-50%);
+  color: #101010;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .status {
@@ -624,6 +645,16 @@ textarea:disabled {
   padding: 0;
   font-size: 18px;
   line-height: 1;
+}
+
+.composer-send-button:focus,
+.composer-send-button:focus-visible {
+  outline: none;
+}
+
+.composer-stop-icon {
+  display: block;
+  flex: none;
 }
 
 .composer-actions {

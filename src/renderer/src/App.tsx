@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { getVersion } from '@tauri-apps/api/app'
 import brandBanner from './assets/hermes-iroh-banner.png'
 import { Composer } from './components/Composer'
 import { SessionList } from './components/SessionList'
@@ -14,12 +15,26 @@ export default function App() {
   const chat = useChatController()
   const { state, cancelPrompt } = chat
   const [activeView, setActiveView] = useState<ActiveView>('chat')
+  const [version, setVersion] = useState<string | null>(null)
   const settingsButtonRef = useRef<HTMLButtonElement>(null)
   const returnFocusToSettingsRef = useRef(false)
 
   useEffect(() => {
-    document.title = formatWindowTitle(state.connection.state)
-  }, [state.connection.state])
+    let active = true
+    void getVersion()
+      .then((value) => {
+        if (active) setVersion(value)
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!version) return
+    document.title = formatWindowTitle(state.connection.state, version)
+  }, [state.connection.state, version])
 
   useEffect(() => {
     if (activeView === 'settings' || !returnFocusToSettingsRef.current) return
@@ -59,7 +74,14 @@ export default function App() {
     <div className="app">
       <aside className="sidebar">
         <header className="brand">
-          <img className="brand-banner" src={brandBanner} alt="Hermes Iroh" />
+          <div className="brand-banner-wrap">
+            <img className="brand-banner" src={brandBanner} alt="Hermes Iroh" />
+            {version ? (
+              <span className="brand-version" title={`Version ${version}`}>
+                {version}
+              </span>
+            ) : null}
+          </div>
         </header>
 
         <SessionList

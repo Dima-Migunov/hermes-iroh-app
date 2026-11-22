@@ -1,6 +1,6 @@
 {
   "name": "hermes-iroh-app",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Desktop client for the Hermes Agent Iroh-channel plugin",
   "type": "module",
   "license": "MIT",

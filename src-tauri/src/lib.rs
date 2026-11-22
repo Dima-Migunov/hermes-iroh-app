@@ -111,9 +111,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
         })
     };
 
+    let app_version = app.package_info().version.to_string();
     let on_status: StatusCallback = {
         let events = Arc::clone(&events);
         let app_handle = app.handle().clone();
+        let app_version = app_version.clone();
         Arc::new(move |status: ConnectionStatus| {
             events.connection_status(status.clone());
             let label = match status.state {
@@ -123,7 +125,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
                 ConnectionState::Error => "Error",
             };
             if let Some(window) = app_handle.get_webview_window("main") {
-                let _ = window.set_title(&format!("Hermes Iroh App — {label}"));
+                let _ = window.set_title(&format!("Hermes Iroh: {app_version} - {label}"));
             }
         })
     };
@@ -170,8 +172,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
 }
 
 fn create_main_window(app: &tauri::App) -> Result<(), AppError> {
+    let version = app.package_info().version.to_string();
     WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("Hermes Iroh App — Disconnected")
+        .title(format!("Hermes Iroh: {version} - Disconnected"))
         .inner_size(1180.0, 780.0)
         .min_inner_size(800.0, 600.0)
         .visible(false)

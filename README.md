@@ -214,7 +214,7 @@ and startup error dialogs are handled by native plugins from Rust.
    return to the chat view.
 6. Send a message. The reply streams in token by token, renders Markdown and highlighted code,
    and can be copied as raw Markdown from the completed message. To stop it — from submission
-   while waiting for the first reply through streaming — choose the stop square (■) in place of
+   while waiting for the first reply through streaming — choose the square stop button in place of
    the send arrow (↑) or press `Escape`.
 
 Provide a server target: either an endpoint ticket or a server NodeId. A ticket is preferred and
@@ -224,7 +224,7 @@ target, or with an unparseable target, is rejected and the previously saved sett
 ### Stopping a response
 
 From the moment a prompt is submitted — including while waiting for the assistant's first
-frame — the composer's primary action shows a stop square (■) in place of the send arrow (↑),
+frame — the composer's primary action shows a square stop icon in place of the send arrow (↑),
 and `Escape` triggers the same action from anywhere in the window. The action stays enabled
 even when the field is empty; activating it with no submittable text sends nothing. The message
 field keeps focus and stays editable while a response is in flight, so the next message can be
@@ -421,13 +421,13 @@ git tag --delete v0.2.1
 1. Start Hermes Agent with the `Iroh-channel` plugin installed (see [Server plugin](#server-plugin)).
    Note its endpoint ticket or NodeId.
 2. Launch `npm run tauri dev` in this directory. Expected: a window opens with the title
-   `Hermes Iroh App — Disconnected`, no application menu bar, a sidebar with the session list and a
+   `Hermes Iroh: <version> - Disconnected`, no application menu bar, a sidebar with the session list and a
    **Settings** action, and a settings page showing a `Disconnected` status and a non-empty
    client NodeId.
 3. Copy the client NodeId from the settings page and run `/iroh_allow <client_node_id>` on the
    server. Expected: the server confirms the allowlist entry.
 4. On the settings page, enter the server ticket (or NodeId), choose **Save & connect**.
-   Expected: the status indicator and window title become `Connected`; restarting the app
+   Expected: the status indicator and window title become `Hermes Iroh: <version> - Connected`; restarting the app
    restores the saved settings and NodeId.
 5. Send `Write a short Python function and explain it`. Expected: the user message appears
    immediately; the assistant message appears when streaming starts and grows in place;
@@ -439,7 +439,7 @@ git tag --delete v0.2.1
 8. Quit and relaunch. Expected: the active session and both transcripts are restored. If the
    app was quit mid-stream, the partial answer is shown as interrupted.
 9. Verify composer behavior: `Enter` sends, `Shift+Enter` inserts a newline, whitespace-only
-   input does nothing, the primary action stays enabled (showing the stop square ■ from
+   input does nothing, the primary action stays enabled (showing the square stop icon from
    submission until `done`, `error`, or a stop), and the message field keeps focus and stays
    editable while a response is in flight, with only submission blocked.
 10. Stop the server and send another prompt. Expected: the request fails with a timeout or
@@ -449,8 +449,8 @@ git tag --delete v0.2.1
     page controls, the session list, message copy buttons, and the composer. Expected: every
     control is reachable, focus is visible, and the connection state is conveyed by text in the
     settings status indicator and the window title as well as color.
-12. Start a long response, then choose the stop button (■); repeat with `Escape`. Expected: the
-    primary action shows the stop square while generating, the partial answer stays visible and
+12. Start a long response, then choose the stop button; repeat with `Escape`. Expected: the
+    primary action shows the square stop icon while generating, the partial answer stays visible and
     is marked interrupted, no error banner appears, and another prompt can be sent immediately.
     If the server briefly answers `session_busy`, retrying after a moment succeeds.
 13. With `Iroh-channel` plugin 1.2.0 or newer running on the server, send a prompt. Expected:

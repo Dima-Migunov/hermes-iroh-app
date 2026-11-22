@@ -11,6 +11,6 @@ export function connectionLabel(state: ConnectionState): string {
   return CONNECTION_LABELS[state]
 }
 
-export function formatWindowTitle(state: ConnectionState): string {
-  return `Hermes Iroh App — ${connectionLabel(state)}`
+export function formatWindowTitle(state: ConnectionState, version: string): string {
+  return `Hermes Iroh: ${version} - ${connectionLabel(state)}`
 }

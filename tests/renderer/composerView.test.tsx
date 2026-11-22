@@ -44,7 +44,9 @@ describe('Composer send action', () => {
   it('replaces the arrow with a stop icon inside the field while generating', () => {
     const html = render(true)
 
-    expect(html).toContain('>■</button>')
+    expect(html).toContain('composer-stop-icon')
+    expect(html).toContain('<rect')
+    expect(html).not.toContain('>■</button>')
     expect(html).not.toContain('>Stop</button>')
     expect(html).toContain('aria-label="Stop"')
     expect(html).toContain('title="Stop"')
