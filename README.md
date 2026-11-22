@@ -1,6 +1,7 @@
 # Hermes Iroh App
 
-A standalone Electron desktop client for the Hermes Agent `Iroh-channel` plugin. It connects
+A standalone Electron desktop client for the Hermes Agent
+[`Iroh-channel`](https://github.com/Dima-Migunov/hermes-iroh-channel) plugin. It connects
 directly to the server over Iroh using ALPN `iroh-channel/1`, keeps its own stable identity, and
 streams agent responses into a local chat UI. Hermes Agent, Python, and the server runtime do
 not need to be installed on the client machine.
@@ -8,8 +9,9 @@ not need to be installed on the client machine.
 ## Prerequisites
 
 - **Node.js ≥ 22.22.2** and npm for building from source.
-- A running Hermes Agent server with the `Iroh-channel` plugin enabled, plus either its
-  `NodeTicket` or its `NodeId`.
+- A running Hermes Agent server with the
+  [`Iroh-channel` plugin](https://github.com/Dima-Migunov/hermes-iroh-channel) enabled, plus
+  either its `NodeTicket` or its `NodeId`.
 - A client `NodeId` added to the server allowlist with `/iroh_allow <client_node_id>`.
 
 Platform support follows the prebuilt `@number0/iroh@1.2.0` binaries:
@@ -22,6 +24,31 @@ Platform support follows the prebuilt `@number0/iroh@1.2.0` binaries:
 
 If the native module cannot load on the host (for example macOS Intel), the app reports a
 startup error instead of running without Iroh.
+
+## Server plugin
+
+The app is only the client half. The Hermes Agent host must run the `Iroh-channel` platform
+plugin, which is installed through the Hermes plugin manager from its repository:
+
+```bash
+hermes plugins install Dima-Migunov/hermes-iroh-channel
+```
+
+Repository and full installation guide:
+<https://github.com/Dima-Migunov/hermes-iroh-channel>
+
+The plugin is distributed as a Hermes plugin, not as a separate archive; the command clones it
+from GitHub into `~/.hermes/plugins/iroh-channel/` and leaves it disabled. Enable the plugin and
+the `iroh` platform, then restart the gateway from outside the agent session:
+
+```bash
+hermes plugins enable iroh-channel
+hermes config set gateway.platforms.iroh.enabled true
+```
+
+See the plugin README's
+[installation section](https://github.com/Dima-Migunov/hermes-iroh-channel#installation) for
+the restart command for your host, `/iroh_info`, and troubleshooting.
 
 ## Download
 
@@ -107,9 +134,9 @@ targets; adding it requires an upstream prebuilt binary or a Rust toolchain buil
 
 ## Connect to a server
 
-1. Start Hermes Agent with the `Iroh-channel` plugin enabled and obtain either the server
-   `NodeTicket` or the server `NodeId`. A ticket is preferred because it already carries
-   reachable addresses; a bare `NodeId` relies on Iroh discovery.
+1. Start Hermes Agent with the `Iroh-channel` plugin enabled (see [Server plugin](#server-plugin))
+   and obtain either the server `NodeTicket` or the server `NodeId`. A ticket is preferred
+   because it already carries reachable addresses; a bare `NodeId` relies on Iroh discovery.
 2. Start the desktop client and open **Settings** from the sidebar. The **Client NodeId** is
    shown under **Connection** on the settings page. It is stable across restarts and is derived
    from `userData/client.key`.
@@ -316,7 +343,8 @@ git tag --delete v0.2.1
 
 ## Manual end-to-end verification
 
-1. Start Hermes Agent with the `Iroh-channel` plugin. Note its ticket or NodeId.
+1. Start Hermes Agent with the `Iroh-channel` plugin installed (see [Server plugin](#server-plugin)).
+   Note its ticket or NodeId.
 2. Launch `npm run dev` in this directory. Expected: a window opens with the title
    `Hermes Iroh App — Disconnected`, no application menu bar, a sidebar with the session list and a
    **Settings** action, and a settings page showing a `Disconnected` status and a non-empty

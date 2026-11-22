@@ -11,6 +11,10 @@ files:
   - package.json
   - node_modules/**
 
+extraResources:
+  - from: build/com.number0.hermes-iroh-app.metainfo.xml
+    to: com.number0.hermes-iroh-app.metainfo.xml
+
 asar: true
 asarUnpack:
   - node_modules/@number0/iroh/**
@@ -21,6 +25,7 @@ npmRebuild: false
 artifactName: ${name}-${version}-${os}-${arch}.${ext}
 
 win:
+  icon: build/icon.ico
   target:
     - target: nsis
       arch:
@@ -32,6 +37,7 @@ nsis:
   allowToChangeInstallationDirectory: true
 
 mac:
+  icon: build/icon.icns
   category: public.app-category.productivity
   identity: "-"
   hardenedRuntime: false
@@ -44,6 +50,7 @@ mac:
         - arm64
 
 linux:
+  icon: build/icons
   category: Network
   target:
     - target: AppImage
@@ -54,3 +61,7 @@ linux:
       arch:
         - x64
         - arm64
+
+deb:
+  afterInstall: build/deb-after-install.sh
+  afterRemove: build/deb-after-remove.sh

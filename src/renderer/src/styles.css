@@ -63,10 +63,16 @@ textarea {
   background: #10161c;
 }
 
-.brand h1 {
-  margin: 0 0 8px;
-  font-size: 18px;
-  letter-spacing: 0.02em;
+.brand {
+  display: flex;
+  justify-content: center;
+}
+
+.brand-banner {
+  display: block;
+  width: 100%;
+  max-width: 300px;
+  height: auto;
 }
 
 .status {
@@ -234,6 +240,20 @@ textarea:disabled {
   gap: 8px;
 }
 
+.new-chat-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.new-chat-button svg {
+  display: block;
+}
+
 .session-list {
   list-style: none;
   margin: 0;
@@ -282,17 +302,39 @@ textarea:disabled {
 
 .sidebar-footer {
   margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sidebar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  white-space: nowrap;
 }
 
 .settings-action {
-  width: 100%;
-  padding: 8px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
   color: var(--text-muted);
-  text-align: left;
   cursor: pointer;
+}
+
+.settings-action svg {
+  display: block;
 }
 
 .settings-action:hover {

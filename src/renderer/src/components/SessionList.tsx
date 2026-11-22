@@ -19,8 +19,23 @@ export function SessionList({
     <nav className="sessions" aria-label="Chat sessions">
       <div className="sessions-heading">
         <h2>Sessions</h2>
-        <button type="button" className="secondary-button" onClick={onCreate} disabled={disabled}>
-          New chat
+        <button
+          type="button"
+          className="secondary-button new-chat-button"
+          onClick={onCreate}
+          disabled={disabled}
+          aria-label="New chat"
+          title="New chat"
+        >
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">
+            <path
+              d="M8 3v10M3 8h10"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            />
+          </svg>
         </button>
       </div>
 
