@@ -178,7 +178,7 @@ textarea {
 
 .sidebar-sessions > .sessions {
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .sidebar--rail .sidebar-sessions {
@@ -383,6 +383,7 @@ textarea:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex: none;
   gap: 8px;
 }
 
@@ -407,6 +408,8 @@ textarea:disabled {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .session-button {

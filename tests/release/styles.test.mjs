@@ -65,12 +65,21 @@ describe('sidebar session scrolling', () => {
     expect(rule).toMatch(/grid-template-rows:\s*1fr/)
   })
 
-  it('makes the Sessions navigation the vertical scroll container', () => {
-    const rule = cssRule('.sidebar-sessions > .sessions')
+  it('keeps the Sessions heading out of the scrolling surface', () => {
+    const nav = cssRule('.sidebar-sessions > .sessions')
+    const heading = cssRule('.sessions-heading')
+
+    expect(nav).toMatch(/min-height:\s*0/)
+    expect(nav).toMatch(/overflow:\s*hidden/)
+    expect(nav).not.toMatch(/overflow-y:\s*auto/)
+    expect(heading).toMatch(/flex:\s*none/)
+  })
+
+  it('makes the session list the vertical scroll container', () => {
+    const rule = cssRule('.session-list')
 
     expect(rule).toMatch(/overflow-y:\s*auto/)
     expect(rule).toMatch(/min-height:\s*0/)
-    expect(rule).not.toMatch(/overflow:\s*hidden/)
   })
 
   it('preserves the collapsing grid row and hidden rail state', () => {
