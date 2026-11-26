@@ -1,6 +1,6 @@
 [package]
 name = "hermes-iroh-app"
-version = "0.8.2"
+version = "0.9.0"
 description = "Desktop client for the Hermes Agent Iroh-channel plugin"
 authors = ["Hermes Iroh App Contributors"]
 license = "MIT"
@@ -26,6 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 url = "2"
 regex = "1"
+rand = "0.10"
 iroh = "=1.5.0"
 iroh-tickets = "=1.0.0"
 

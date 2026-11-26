@@ -149,6 +149,7 @@ export default function App() {
           <Transcript
             messages={chat.messages}
             generating={state.generating}
+            sessionId={state.activeSessionId}
             onCopy={chat.copyText}
           />
 

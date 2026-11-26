@@ -1,10 +1,12 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, Endpoint};
 use iroh::SecretKey;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::errors::{map_iroh_error_with, AppError, ErrorCode};
@@ -20,6 +22,8 @@ pub const ALPN_PROTOCOL: &[u8] = b"iroh-channel/1";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+const RETRY_SENTENCE: &str = "Retrying automatically in ";
 
 pub type StatusCallback = Arc<dyn Fn(ConnectionStatus) + Send + Sync>;
 pub type EventEmitter = Arc<dyn Fn(PromptEvent) + Send + Sync>;
@@ -40,6 +44,7 @@ enum OpenError {
 
 struct Shared {
     status: std::sync::Mutex<ConnectionStatus>,
+    status_tx: watch::Sender<ConnectionStatus>,
     on_status: Option<StatusCallback>,
     connection: Mutex<Option<Connection>>,
 }
@@ -67,6 +72,7 @@ impl Shared {
         };
 
         if changed {
+            let _ = self.status_tx.send_replace(status.clone());
             if let Some(callback) = &self.on_status {
                 callback(status);
             }
@@ -83,6 +89,12 @@ pub struct IrohClient {
     shared: Arc<Shared>,
     shutting_down: AtomicBool,
     connecting: Mutex<Option<CancellationToken>>,
+    #[cfg(test)]
+    attempts_started: AtomicUsize,
+    #[cfg(test)]
+    attempts_in_flight: AtomicUsize,
+    #[cfg(test)]
+    max_attempts_in_flight: AtomicUsize,
 }
 
 impl IrohClient {
@@ -92,6 +104,8 @@ impl IrohClient {
         on_status: Option<StatusCallback>,
         connect_timeout: Option<Duration>,
     ) -> Self {
+        let (status_tx, _) = watch::channel(ConnectionStatus::disconnected());
+
         Self {
             secret_key,
             get_config,
@@ -100,16 +114,67 @@ impl IrohClient {
             endpoint: Mutex::new(None),
             shared: Arc::new(Shared {
                 status: std::sync::Mutex::new(ConnectionStatus::disconnected()),
+                status_tx,
                 on_status,
                 connection: Mutex::new(None),
             }),
             shutting_down: AtomicBool::new(false),
             connecting: Mutex::new(None),
+            #[cfg(test)]
+            attempts_started: AtomicUsize::new(0),
+            #[cfg(test)]
+            attempts_in_flight: AtomicUsize::new(0),
+            #[cfg(test)]
+            max_attempts_in_flight: AtomicUsize::new(0),
         }
     }
 
     pub fn get_status(&self) -> ConnectionStatus {
         self.shared.get_status()
+    }
+
+    /// Observes every distinct connection status. Only actual state or message changes are
+    /// published, never repeated values.
+    pub fn subscribe_status(&self) -> watch::Receiver<ConnectionStatus> {
+        self.shared.status_tx.subscribe()
+    }
+
+    /// Resets the reported state without closing anything. Used by the supervisor when no
+    /// server target is configured and no attempt should be reported as pending.
+    pub fn reset_to_disconnected(&self) {
+        self.shared.set_status(ConnectionStatus::disconnected());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attempts_started(&self) -> usize {
+        self.attempts_started.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_attempts_in_flight(&self) -> usize {
+        self.max_attempts_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Keeps the current failure message and appends when the next automatic attempt is due.
+    /// A previously appended sentence is replaced rather than repeated.
+    pub fn report_automatic_retry(&self, delay: Duration) {
+        let base = self
+            .get_status()
+            .message
+            .unwrap_or_default()
+            .split(RETRY_SENTENCE)
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned();
+        let seconds = delay.as_millis().div_ceil(1000).max(1);
+        let sentence = format!("{RETRY_SENTENCE}{seconds} s.");
+        let message = if base.is_empty() {
+            sentence
+        } else {
+            format!("{base} {sentence}")
+        };
+        self.shared.set_status(ConnectionStatus::error(message));
     }
 
     pub fn connect(&self) -> impl std::future::Future<Output = ConnectionStatus> + '_ {
@@ -358,6 +423,9 @@ impl IrohClient {
             ));
         }
 
+        #[cfg(test)]
+        let _attempt_guard = AttemptGuard::begin(self);
+
         self.shared.set_status(ConnectionStatus::connecting());
 
         let attempt_token = CancellationToken::new();
@@ -484,6 +552,32 @@ impl IrohClient {
                 shared.set_status(ConnectionStatus::disconnected());
             }
         });
+    }
+}
+
+#[cfg(test)]
+struct AttemptGuard<'a> {
+    in_flight: &'a AtomicUsize,
+}
+
+#[cfg(test)]
+impl<'a> AttemptGuard<'a> {
+    fn begin(client: &'a IrohClient) -> Self {
+        client.attempts_started.fetch_add(1, Ordering::SeqCst);
+        let current = client.attempts_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        client
+            .max_attempts_in_flight
+            .fetch_max(current, Ordering::SeqCst);
+        Self {
+            in_flight: &client.attempts_in_flight,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AttemptGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -646,6 +740,81 @@ mod tests {
             .await;
         let collected = events.lock().expect("event lock").clone();
         collected
+    }
+
+    #[tokio::test]
+    async fn publishes_a_distinct_status_only_when_it_changes() {
+        let config = ClientConfig::default();
+        let client = IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            None,
+        );
+        let mut statuses = client.subscribe_status();
+
+        assert!(!statuses.has_changed().expect("watch is open"));
+        client.shared.set_status(ConnectionStatus::connecting());
+        assert!(statuses.has_changed().expect("watch is open"));
+        assert_eq!(
+            statuses.borrow_and_update().state,
+            ConnectionState::Connecting
+        );
+
+        client.shared.set_status(ConnectionStatus::connecting());
+        assert!(!statuses.has_changed().expect("watch is open"));
+
+        client.shared.set_status(ConnectionStatus::connected());
+        assert!(statuses.has_changed().expect("watch is open"));
+        assert_eq!(
+            statuses.borrow_and_update().state,
+            ConnectionState::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn appends_the_retry_sentence_to_the_current_error() {
+        let config = ClientConfig::default();
+        let client = IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            None,
+        );
+
+        client.shared.set_status(ConnectionStatus::error(
+            "The server refused the connection.",
+        ));
+        client.report_automatic_retry(Duration::from_secs(4));
+        assert_eq!(
+            client.get_status().message.as_deref(),
+            Some("The server refused the connection. Retrying automatically in 4 s.")
+        );
+
+        client.report_automatic_retry(Duration::from_millis(800));
+        assert_eq!(
+            client.get_status().message.as_deref(),
+            Some("The server refused the connection. Retrying automatically in 1 s.")
+        );
+    }
+
+    #[tokio::test]
+    async fn resetting_to_disconnected_clears_the_retry_message() {
+        let config = ClientConfig::default();
+        let client = IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            None,
+        );
+
+        client
+            .shared
+            .set_status(ConnectionStatus::error("The server is offline."));
+        client.report_automatic_retry(Duration::from_secs(2));
+        client.reset_to_disconnected();
+
+        assert_eq!(client.get_status(), ConnectionStatus::disconnected());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

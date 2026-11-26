@@ -1,57 +1,89 @@
-import { useLayoutEffect, useRef } from 'react'
+import type { WheelEvent } from 'react'
 import type { StoredMessage } from '@shared/protocol'
+import { useTranscriptScroll } from '../useTranscriptScroll'
 import { MessageItem } from './MessageItem'
 
 interface TranscriptProps {
   messages: StoredMessage[]
   generating: boolean
+  sessionId: string | null
   onCopy: (text: string) => Promise<void>
 }
 
-export function Transcript({ messages, generating, onCopy }: TranscriptProps) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const pinnedRef = useRef(true)
+export function Transcript({ messages, generating, sessionId, onCopy }: TranscriptProps) {
+  const {
+    containerRef,
+    contentRef,
+    onScroll,
+    newMessageCount,
+    hasUnseenActivity,
+    returnToLatest,
+  } = useTranscriptScroll(messages, sessionId)
 
-  useLayoutEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      const container = containerRef.current
-      if (container && pinnedRef.current) {
-        container.scrollTop = container.scrollHeight
-      }
-    })
+  const showNewMessages = newMessageCount > 0 || hasUnseenActivity
+  const label =
+    newMessageCount > 0 ? `New messages, ${newMessageCount} new` : 'New messages'
 
-    return () => cancelAnimationFrame(frame)
-  }, [messages])
+  const handleReturnToLatest = (): void => {
+    returnToLatest()
+    containerRef.current?.focus({ preventScroll: true })
+  }
 
-  const handleScroll = (): void => {
+  const handleNavWheel = (event: WheelEvent<HTMLDivElement>): void => {
     const container = containerRef.current
     if (!container) return
-    const distance = container.scrollHeight - container.scrollTop - container.clientHeight
-    pinnedRef.current = distance < 48
+    if (typeof container.scrollBy === 'function') {
+      container.scrollBy({ top: event.deltaY })
+    } else {
+      container.scrollTop += event.deltaY
+    }
   }
 
   return (
-    <div
-      className="transcript"
-      ref={containerRef}
-      onScroll={handleScroll}
-      role="log"
-      aria-label="Conversation transcript"
-      aria-live="polite"
-      aria-busy={generating}
-    >
-      {messages.length === 0 ? (
-        <div className="empty-state">
-          <h2>No messages yet</h2>
-          <p>Connect to the server, then start the conversation below.</p>
+    <div className="transcript-shell">
+      <div
+        className={showNewMessages ? 'transcript transcript--has-new' : 'transcript'}
+        ref={containerRef}
+        onScroll={onScroll}
+        role="log"
+        tabIndex={0}
+        aria-label="Conversation transcript"
+        aria-live="polite"
+        aria-busy={generating}
+      >
+        <div className="transcript-content" ref={contentRef}>
+          {messages.length === 0 ? (
+            <div className="empty-state">
+              <h2>No messages yet</h2>
+              <p>Connect to the server, then start the conversation below.</p>
+            </div>
+          ) : (
+            <ol className="message-list">
+              {messages.map((message) => (
+                <MessageItem key={message.id} message={message} onCopy={onCopy} />
+              ))}
+            </ol>
+          )}
         </div>
-      ) : (
-        <ol className="message-list">
-          {messages.map((message) => (
-            <MessageItem key={message.id} message={message} onCopy={onCopy} />
-          ))}
-        </ol>
-      )}
+      </div>
+
+      {showNewMessages ? (
+        <div className="transcript-nav" onWheel={handleNavWheel}>
+          <button
+            type="button"
+            className="new-messages-button"
+            aria-label={label}
+            onClick={handleReturnToLatest}
+          >
+            <span>New messages</span>
+            {newMessageCount > 0 ? (
+              <span className="new-messages-count" aria-hidden="true">
+                {newMessageCount}
+              </span>
+            ) : null}
+          </button>
+        </div>
+      ) : null}
     </div>
   )
 }

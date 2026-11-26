@@ -235,7 +235,7 @@ pub async fn connection_connect(
     state: State<'_, AppState>,
 ) -> Result<ConnectionStatus, AppError> {
     ensure_main_window(&window)?;
-    Ok(state.client.connect().await)
+    Ok(state.supervisor.connect().await)
 }
 
 #[tauri::command]
@@ -244,7 +244,7 @@ pub async fn connection_disconnect(
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
     ensure_main_window(&window)?;
-    state.client.disconnect().await;
+    state.supervisor.disconnect().await;
     Ok(())
 }
 

@@ -5,6 +5,7 @@ use tauri::AppHandle;
 
 use crate::events::EventSink;
 use crate::iroh::client::IrohClient;
+use crate::iroh::supervisor::ConnectionSupervisor;
 use crate::prompt::PromptCoordinator;
 use crate::protocol::ClientConfig;
 use crate::sessions::SessionStore;
@@ -14,6 +15,7 @@ pub struct AppState {
     pub node_id: String,
     pub config_store: Arc<RwLock<ConfigStore>>,
     pub client: Arc<IrohClient>,
+    pub supervisor: Arc<ConnectionSupervisor>,
     pub sessions: SessionStore,
     pub coordinator: Arc<PromptCoordinator>,
     pub events: Arc<dyn EventSink>,

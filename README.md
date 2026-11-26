@@ -229,7 +229,7 @@ src/renderer/src/bridge.ts
                      typed Tauri command/event adapter with the IpcApi shape
 src/shared/          renderer-facing TypeScript protocol and bridge types
 src-tauri/src/       Rust backend:
-  iroh/              endpoint, connection, and prompt streaming
+  iroh/              endpoint, connection supervision, retry policy, and prompt streaming
   protocol.rs        JSON Lines framing and the response state machine
   prompt.rs          single-prompt lock, cancellation, and persistence
   sessions.rs        session and transcript store
@@ -282,6 +282,22 @@ background-color, and page-load show options.
 Provide a server target: either an endpoint ticket or a server NodeId. A ticket is preferred and
 wins when both fields are filled in, in which case the NodeId is dropped. A save with neither
 target, or with an unparseable target, is rejected and the previously saved settings stay in effect.
+
+### Automatic reconnection
+
+While a server target is configured and the app is active, the client retries a failed or
+dropped connection without user action. The delays after consecutive failures are 1, 2, 5, and
+10 seconds, then 20 seconds for every later attempt, each with ±20% jitter and never more than
+20 seconds. A successful connection resets the schedule to the first step. While waiting, the
+status remains `error` and its message ends with `Retrying automatically in N s.`
+
+A manual **Connect**, applying a target from settings, or resuming the Android app attempts
+immediately instead of waiting for the remaining delay. Prompts submitted during a retry share
+the single in-flight connection attempt and never open a second one.
+
+Automatic retries stop when you choose **Disconnect**, when Android suspends the app, and when
+no server target is configured. Android runs no foreground service; resuming with a target
+reconnects immediately and continues the backoff if that attempt fails.
 
 ### Stopping a response
 
@@ -431,15 +447,17 @@ A successful `done` frame may include `metadata` describing the turn. The server
   is released immediately, and the partial message is stored as `interrupted`.
 - At most one prompt is in flight. A second submission is rejected as busy.
 - Connection reuse is attempted across prompts; if the server closes the connection, the next
-  prompt reconnects before sending.
+  prompt reconnects before sending. While automatic reconnection is active, a closed connection
+  is also re-established without waiting for the next prompt.
 
 ## Troubleshooting
 
 | Symptom | Meaning and action |
 | --- | --- |
-| `Connecting…` then timeout | The server was not reachable within 30 seconds. Re-check the ticket/NodeId, relay URL, and that the plugin is running. |
+| `Connecting…` then timeout | The server was not reachable within 30 seconds. Re-check the ticket/NodeId, relay URL, and that the plugin is running. Retries continue automatically with backoff; choose **Disconnect** to stop them. |
 | Connection closed before a response | The client was likely rejected. Run `/iroh_allow <client_node_id>` for the NodeId shown on the settings page. |
-| Connection reset / refused | The server or relay dropped the connection. Retry, check the relay URL, and confirm the server is online. |
+| Connection reset / refused | The server or relay dropped the connection. The client retries automatically after 1, 2, 5, and 10 seconds, then every 20 seconds; choose **Connect** to try immediately or **Disconnect** to stop. |
+| Repeated `error` with `Retrying automatically in …` | The client is waiting for the next automatic attempt. Fix the target or server, press **Connect** to retry immediately, or press **Disconnect** to stop retries. |
 | `startup reports an identity error` | `client.key` is unreadable or not 32 bytes. Restore the backup or deliberately delete it to create a new identity. |
 | Window does not start on Linux | Install the WebKitGTK 4.1 runtime (`libwebkit2gtk-4.1-0`) and a GTK-compatible desktop session. |
 | Settings will not save | A target is required and the ticket/NodeId must parse. If both fields are filled the ticket wins and the NodeId is dropped. The last valid settings remain active. |
@@ -449,7 +467,7 @@ A successful `done` frame may include `metadata` describing the turn. The server
 | No Android asset for the device | Only an arm64 APK for Android 7.0 (API 24) and newer is published. 32-bit ARM and x86 devices are not supported. |
 | Android blocks the APK install | Allow installation from unknown sources for the browser or file manager that opens the APK, then open it again. |
 | Android renders a blank or outdated UI | Update the system WebView from the Play Store or the device's app store; the app does not bundle a browser engine. |
-| Android stops a response when backgrounded | The app closes its Iroh endpoint while suspended and saves the partial answer as interrupted. Return to the app to reconnect. |
+| Android stops a response when backgrounded | The app closes its Iroh endpoint while suspended and saves the partial answer as interrupted. Return to the app to reconnect immediately; automatic retries resume while it is in the foreground. |
 
 ## Publishing a release
 

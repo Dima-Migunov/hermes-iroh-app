@@ -24,7 +24,9 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::errors::AppError;
 use crate::events::{EventSink, TauriEventSink};
-use crate::iroh::client::{IrohClient, StatusCallback};
+use crate::iroh::client::{ConfigProvider, IrohClient, StatusCallback};
+use crate::iroh::retry::RetryPolicy;
+use crate::iroh::supervisor::ConnectionSupervisor;
 use crate::prompt::PromptCoordinator;
 #[cfg(desktop)]
 use crate::protocol::ConnectionState;
@@ -132,7 +134,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
     notices.extend(tauri::async_runtime::block_on(sessions.get_warnings()));
 
     let config_store = Arc::new(RwLock::new(config_store));
-    let get_config = {
+    let get_config: ConfigProvider = {
         let store = Arc::clone(&config_store);
         Arc::new(move || {
             store
@@ -167,9 +169,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
 
     let client = Arc::new(IrohClient::new(
         identity.secret_key.clone(),
-        get_config,
+        Arc::clone(&get_config),
         Some(on_status),
         None,
+    ));
+    let supervisor = Arc::new(ConnectionSupervisor::new(
+        Arc::clone(&client),
+        get_config,
+        RetryPolicy::production(),
     ));
     let transport: crate::prompt::PromptTransportRef = client.clone();
     let coordinator = Arc::new(PromptCoordinator::new(
@@ -183,6 +190,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
         node_id: identity.node_id,
         config_store,
         client: Arc::clone(&client),
+        supervisor: Arc::clone(&supervisor),
         sessions,
         coordinator,
         events: Arc::clone(&events),
@@ -201,7 +209,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), AppError> {
 
     if has_target {
         tauri::async_runtime::spawn(async move {
-            client.connect().await;
+            supervisor.connect().await;
         });
     }
 
@@ -351,21 +359,24 @@ fn show_fatal(app: &AppHandle, title: &str, message: &str) -> ! {
 #[cfg(desktop)]
 fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
     if let RunEvent::ExitRequested { api, .. } = event {
-        let (coordinator, client) = {
+        let (coordinator, supervisor) = {
             let Some(state) = app_handle.try_state::<AppState>() else {
                 return;
             };
             if state.shutdown_started.swap(true, Ordering::SeqCst) {
                 return;
             }
-            (Arc::clone(&state.coordinator), Arc::clone(&state.client))
+            (
+                Arc::clone(&state.coordinator),
+                Arc::clone(&state.supervisor),
+            )
         };
 
         api.prevent_exit();
         let handle = app_handle.clone();
         tauri::async_runtime::spawn(async move {
             let _ = coordinator.shutdown().await;
-            client.close().await;
+            supervisor.close().await;
             handle.exit(0);
         });
     }
@@ -395,7 +406,7 @@ fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
     };
     let coordinator = Arc::clone(&state.coordinator);
     let sessions = state.sessions.clone();
-    let client = Arc::clone(&state.client);
+    let supervisor = Arc::clone(&state.supervisor);
     let has_target = state.has_server_target();
     let lock = Arc::clone(&state.lifecycle);
 
@@ -405,11 +416,11 @@ fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
             Lifecycle::Suspend => {
                 let _ = coordinator.cancel_prompt().await;
                 let _ = sessions.flush_all().await;
-                client.close().await;
+                supervisor.close().await;
             }
             Lifecycle::Resume => {
                 if has_target {
-                    client.restart().await;
+                    supervisor.restart().await;
                 }
             }
         }
