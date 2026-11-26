@@ -30,7 +30,7 @@ export const MessageItem = memo(function MessageItem({ message, onCopy }: Messag
   const isUser = message.role === 'user'
 
   return (
-    <li className={`message message--${message.role}`}>
+    <li className={`message message--${message.role}`} data-message-id={message.id}>
       <header className="message-header">
         <span className="message-author">{isUser ? 'You' : 'Assistant'}</span>
         <time className="message-time" dateTime={message.createdAt}>

@@ -6,6 +6,7 @@ import type {
   ClientConfig,
   ConnectionStatus,
   PromptEvent,
+  SessionDeletionResult,
   SessionSnapshot,
   SessionSummary,
 } from '@shared/protocol'
@@ -32,6 +33,12 @@ function requireNonEmptyString(value: unknown, name: string): string {
   const text = requireString(value, name)
   if (text.length === 0) throw new TypeError(`${name} must not be empty.`)
   return text
+}
+
+function requireSessionTitle(value: unknown): string {
+  const title = requireNonEmptyString(value, 'session title').trim()
+  if (title.length === 0) throw new TypeError('session title must not be empty.')
+  return title
 }
 
 function requireNullableString(value: unknown, name: string): string | null {
@@ -142,6 +149,17 @@ const api: IpcApi = {
 
   activateSession: async (id: string) =>
     call<SessionSnapshot>('sessions_activate', {
+      sessionId: requireNonEmptyString(id, 'session id'),
+    }),
+
+  renameSession: async (id: string, title: string) =>
+    call<SessionSummary>('sessions_rename', {
+      sessionId: requireNonEmptyString(id, 'session id'),
+      title: requireSessionTitle(title),
+    }),
+
+  deleteSession: async (id: string) =>
+    call<SessionDeletionResult>('sessions_delete', {
       sessionId: requireNonEmptyString(id, 'session id'),
     }),
 

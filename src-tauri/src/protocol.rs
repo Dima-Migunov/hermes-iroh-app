@@ -249,12 +249,25 @@ pub struct SessionSummary {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub custom_title: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub session: SessionSummary,
     pub messages: Vec<StoredMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeletionResult {
+    pub sessions: Vec<SessionSummary>,
+    pub active_session: SessionSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -551,6 +564,44 @@ impl<'a> PromptStateMachine<'a> {
 mod tests {
     use super::*;
     use crate::errors::AppError;
+
+    #[test]
+    fn serializes_custom_titles_and_deletion_results() {
+        let summary = SessionSummary {
+            id: "session-1".to_owned(),
+            title: "Chat".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            custom_title: false,
+        };
+        let value = serde_json::to_value(&summary).expect("serialize");
+        assert!(value.get("customTitle").is_none());
+
+        let mut custom = summary.clone();
+        custom.custom_title = true;
+        let value = serde_json::to_value(&custom).expect("serialize");
+        assert_eq!(value["customTitle"], true);
+
+        let legacy: SessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "session-1",
+            "title": "Chat",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z"
+        }))
+        .expect("legacy summary");
+        assert!(!legacy.custom_title);
+
+        let result = SessionDeletionResult {
+            sessions: vec![custom],
+            active_session: SessionSnapshot {
+                session: summary,
+                messages: Vec::new(),
+            },
+        };
+        let value = serde_json::to_value(&result).expect("serialize result");
+        assert!(value.get("activeSession").is_some());
+        assert!(value.get("active_session").is_none());
+    }
 
     #[test]
     fn serializes_the_exact_protocol_line() {

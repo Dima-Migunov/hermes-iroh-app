@@ -234,7 +234,7 @@ src-tauri/src/       Rust backend:
   prompt.rs          single-prompt lock, cancellation, and persistence
   sessions.rs        session and transcript store
   storage/           atomic files, key, config, and history stores
-  commands.rs        the 15 registered commands and their validation
+  commands.rs        the 17 registered commands and their validation
   events.rs          prompt, connection, history, and notice events
   state.rs, lib.rs   application wiring, window, menu, and shutdown
 src-tauri/gen/android/
@@ -363,6 +363,13 @@ they grow, flushed on terminal outcomes and on quit, and any message still marke
 at startup is restored as `interrupted`. Invalid history files are preserved next to the
 original as `*.corrupt-<timestamp>` and the affected session starts empty with a notice.
 
+Renaming a session updates only its index metadata and sets `customTitle`; the timestamp and
+list position stay unchanged, and later first-message title derivation never overwrites the
+choice. Deleting a session removes its index entry and transcript. If it was active, the most
+recently updated remaining session becomes active; deleting the last session creates a fresh
+empty one, so history always keeps at least one session. A failed index write restores the
+previous in-memory state and leaves the transcript intact.
+
 ## Security model
 
 - The renderer runs in the operating system webview with no Node.js integration, filesystem
@@ -370,7 +377,7 @@ original as `*.corrupt-<timestamp>` and the affected session starts empty with a
 - The only bridge is one frozen typed object (`src/renderer/src/bridge.ts`) over Tauri
   `invoke`/`listen`. It contains only the documented operations; there is no generic command
   surface, and `window.__TAURI__` is not exposed (`withGlobalTauri: false`).
-- The backend registers exactly 15 commands, checks that the caller is the `main` window, and
+- The backend registers exactly 17 commands, checks that the caller is the `main` window, and
   validates every payload and its length before touching keys, configuration, storage, or the
   network. Invalid requests fail without side effects.
 - Only locally packaged renderer content is loaded. The production CSP disallows remote scripts
@@ -601,6 +608,33 @@ git tag --delete v0.2.1
     metadata). Expected: the response completes normally, no composer status appears, and no error
     appears. Stop a response mid-stream against a metadata-capable server: expected, the partial
     message is marked interrupted and the composer status keeps its previous values.
+17. Hover the `...` area at the end of a session row, focus it with the keyboard, and tap it in a
+    touch-emulated viewport. Expected: **Rename** and **Delete** cross-fade into the same fixed
+    slot, only one row is open at a time, `Escape` closes it and returns focus to the trigger, and
+    actions are unavailable while a response is generating.
+18. Choose **Rename**, edit the prefilled title, and press `Enter`; try an empty title and `Escape`.
+    Expected: empty input shows an inline message and stays open, cancel restores the old title,
+    save updates the row immediately without reordering it, and the custom title survives the
+    first message and an app restart.
+19. Choose **Delete** and confirm or cancel; repeat for the active session, an inactive session,
+    and the only session. Expected: the destructive confirmation appears first and focuses
+    **Cancel**, confirming removes the session and its transcript, deleting the active session
+    selects the most recently updated remainder, deleting the last session creates a new empty
+    chat, and focus moves to the newly active row. A failed delete keeps the row and shows a
+    warning.
+20. Open a conversation with at least three user messages and enough content to overflow the
+    transcript, then hover, focus with `Tab`, and activate markers in the rail at the trailing
+    edge. Expected: one short marker per user message appears in the gutter left of the scrollbar;
+    hover and keyboard focus open a tooltip containing only that user message's text, clamped
+    inside the chat and clear of the marker; each marker is named
+    `Your message <n> of <total>: <preview>` with a visible focus ring. Clicking or pressing
+    `Enter` scrolls the message to the top with a small inset, no rail appears for assistant-only
+    or fitting transcripts, and a jump far up stops following streamed content while a jump near
+    the bottom keeps following.
+21. Enable reduced motion, narrow the window to 720 px, and send a long reply. Expected: marker
+    activation jumps immediately with no smooth scroll, the rail stays usable without covering
+    message text at compact widths, and a dense conversation keeps every marker visible and
+    focusable in order.
 
 ### Android end-to-end checklist
 
@@ -629,6 +663,11 @@ git tag --delete v0.2.1
 10. Verify the merged manifest with
     `aapt dump permissions hermes-iroh-app-<version>-android-arm64.apk`. Expected: only
     `android.permission.INTERNET`, with no storage, location, or foreground-service permission.
+11. Open a conversation with several user messages and scroll back through it. Expected: the
+    marker rail appears in the trailing gutter beside the transcript; tapping a marker jumps to
+    that user message without leaving a tooltip or requiring a hover; the rail stays inside the
+    chat and every marker remains tappable in a dense conversation; with system animations
+    disabled the jump is immediate.
 
 Automated checks cover the wire contract against a real in-process Iroh endpoint: exact prompt
 bytes, start/delta/done ordering, server errors, early close with the allowlist hint, malformed

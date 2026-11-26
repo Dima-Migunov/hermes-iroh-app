@@ -31,6 +31,8 @@ function render(overrides: Partial<Parameters<typeof Sidebar>[0]> = {}): string 
       onToggle={() => undefined}
       onCreate={() => undefined}
       onSelect={() => undefined}
+      onRename={async () => true}
+      onDelete={async () => null}
       onSettings={() => undefined}
       onBackdrop={() => undefined}
       {...overrides}
@@ -61,6 +63,28 @@ describe('Sidebar expanded state', () => {
     expect(html).toContain('aria-expanded="true"')
     expect(html).toContain('aria-controls="app-sidebar"')
     expect(html).not.toContain('aria-label="Expand sidebar"')
+  })
+})
+
+describe('Sidebar session actions', () => {
+  it('keeps the select control and the action trigger as sibling buttons', () => {
+    const html = render()
+
+    expect(html).toContain('class="session-row session-row--active"')
+    expect(html).toContain('</button><div class="session-actions">')
+    expect(html).toContain('aria-label="Session actions"')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).toContain('aria-label="Rename session"')
+    expect(html).toContain('aria-label="Delete session"')
+    expect(html).toMatch(/aria-current="true"/)
+  })
+
+  it('marks both action buttons disabled while generation runs', () => {
+    const html = render({ disabled: true })
+
+    expect(html).toMatch(/aria-label="Rename session"[^>]*disabled=""/)
+    expect(html).toMatch(/aria-label="Delete session"[^>]*disabled=""/)
+    expect(html).toMatch(/class="session-button[^"]*"[^>]*disabled=""/)
   })
 })
 
@@ -126,6 +150,6 @@ describe('Sidebar accessibility', () => {
 
     expect(html).toContain('<div class="sidebar-sessions">')
     expect(html).toContain('<div class="brand-banner-wrap">')
-    expect(html).not.toContain('inert=""')
+    expect(html).not.toContain('<div class="sidebar-sessions" inert')
   })
 })

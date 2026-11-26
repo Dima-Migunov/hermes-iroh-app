@@ -32,6 +32,32 @@ describe('reduced motion styles', () => {
     expect(reducedMotionBlock()).toMatch(/\.sidebar[\s,]/)
     expect(reducedMotionBlock()).toMatch(/transition:\s*none/)
   })
+
+  it('disables the session action cross-fade', () => {
+    const block = reducedMotionBlock()
+
+    expect(block).toMatch(/\.session-actions-trigger,[\s\S]*?\.session-actions-menu[\s\S]*?transition:\s*none/)
+  })
+})
+
+describe('session row actions', () => {
+  it('reserves a fixed action slot beside the select button', () => {
+    expect(cssRule('.session-row')).toMatch(/position:\s*relative/)
+    expect(cssRule('.session-button')).toMatch(/padding:\s*8px 62px 8px 10px/)
+    expect(cssRule('.session-actions')).toMatch(/position:\s*absolute/)
+    expect(cssRule('.session-actions')).toMatch(/width:\s*52px/)
+  })
+
+  it('cross-fades the trigger into the rename and delete controls', () => {
+    expect(css).toMatch(/\.session-actions-trigger,[\s\S]*?opacity 120ms ease/)
+    expect(css).toMatch(/\.session-actions--open \.session-actions-trigger\s*\{[^}]*opacity:\s*0/)
+    expect(css).toMatch(/\.session-actions--open \.session-actions-menu\s*\{[^}]*opacity:\s*1/)
+  })
+
+  it('styles the destructive confirmation distinctly', () => {
+    expect(cssRule('.session-delete-confirm')).toMatch(/border:\s*1px solid var\(--danger\)/)
+    expect(cssRule('.danger-button')).toMatch(/color:\s*var\(--danger\)/)
+  })
 })
 
 describe('composer send button focus', () => {
@@ -42,6 +68,49 @@ describe('composer send button focus', () => {
 
     expect(rule).toContain('outline: 2px solid var(--accent)')
     expect(rule).not.toContain('outline: none')
+  })
+})
+
+describe('user message rail', () => {
+  it('overlays the transcript gutter without taking pointer events from the chat', () => {
+    const rail = cssRule('.user-message-rail')
+
+    expect(rail).toMatch(/position:\s*absolute/)
+    expect(rail).toMatch(/pointer-events:\s*none/)
+    expect(rail).not.toMatch(/overflow-y:\s*auto/)
+  })
+
+  it('gives each marker a clickable hit area', () => {
+    const marker = cssRule('.user-message-rail__marker')
+
+    expect(marker).toMatch(/pointer-events:\s*auto/)
+    expect(marker).toMatch(/width:\s*16px/)
+  })
+
+  it('shows a visible focus ring on the marker buttons', () => {
+    const start = css.indexOf('.user-message-rail__marker:focus-visible')
+    expect(start).toBeGreaterThan(-1)
+    const rule = css.slice(start, css.indexOf('}', start))
+
+    expect(rule).toContain('outline: 2px solid var(--accent)')
+  })
+
+  it('bounds the tooltip and fades truncated text', () => {
+    const tooltip = cssRule('.user-message-rail__tooltip')
+
+    expect(tooltip).toMatch(/width:\s*max-content/)
+    expect(tooltip).toMatch(/max-height:\s*50%/)
+    expect(tooltip).toMatch(/overflow:\s*hidden/)
+    expect(css).toMatch(/\.user-message-rail__tooltip::after\s*\{[^}]*linear-gradient/)
+  })
+
+  it('removes rail transitions under reduced motion without hiding anything', () => {
+    const block = reducedMotionBlock()
+
+    expect(block).toMatch(
+      /\.user-message-rail__marker,[\s\S]*?\.user-message-rail__line[\s\S]*?\.user-message-rail__tooltip[\s\S]*?transition:\s*none/,
+    )
+    expect(block).not.toMatch(/\.user-message-rail[^}]*visibility:\s*hidden/)
   })
 })
 

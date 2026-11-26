@@ -8,13 +8,13 @@ use uuid::Uuid;
 
 use crate::errors::{AppError, ErrorCode};
 use crate::protocol::{
-    MessageRole, MessageStatus, ResponseMetadata, SessionSnapshot, SessionSummary, StoredError,
-    StoredMessage,
+    MessageRole, MessageStatus, ResponseMetadata, SessionDeletionResult, SessionSnapshot,
+    SessionSummary, StoredError, StoredMessage,
 };
 use crate::storage::history::{write_document, HistoryIndex, HistoryStore};
 
 pub const FALLBACK_TITLE: &str = "New chat";
-const TITLE_LIMIT: usize = 60;
+pub const TITLE_LIMIT: usize = 60;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_CACHED_SESSIONS: usize = 5;
 const MAX_WARNINGS: usize = 20;
@@ -53,6 +53,9 @@ struct Inner {
     timers: HashMap<String, tokio::task::JoinHandle<()>>,
     /// One write lock per session so writes never overlap or reorder.
     write_locks: HashMap<String, Arc<Mutex<()>>>,
+    /// Sessions whose transcript is being deleted. Writes prepared before the deletion
+    /// must not recreate the file afterwards.
+    deleting: HashSet<String>,
     index_dirty: bool,
     warnings: Vec<String>,
     listener: Option<ChangeListener>,
@@ -65,6 +68,7 @@ pub struct SessionStore {
 
 /// Bytes to write after the store lock is released.
 struct PreparedWrite {
+    store: Arc<Mutex<Inner>>,
     history: HistoryStore,
     write_lock: Arc<Mutex<()>>,
     session_id: String,
@@ -75,6 +79,18 @@ struct PreparedWrite {
 impl PreparedWrite {
     async fn execute(self) -> Result<(), AppError> {
         let _guard = self.write_lock.lock().await;
+        {
+            let inner = self.store.lock().await;
+            let exists = inner
+                .index
+                .sessions
+                .iter()
+                .any(|session| session.id == self.session_id);
+            if inner.deleting.contains(&self.session_id) || !exists {
+                return Ok(());
+            }
+        }
+
         let PreparedWrite {
             history,
             session_id,
@@ -96,10 +112,39 @@ impl PreparedWrite {
     }
 }
 
+/// State captured under the store lock before a deletion is persisted.
+struct DeletionPlan {
+    session_id: String,
+    previous_index: HistoryIndex,
+    previous_index_dirty: bool,
+    previous_usage: Vec<String>,
+    previous_dirty: HashSet<String>,
+    cached_before: HashSet<String>,
+    deleted_messages: Option<Vec<StoredMessage>>,
+    replacement_id: Option<String>,
+    replacement_bytes: Option<Vec<u8>>,
+    index_bytes: Vec<u8>,
+    sessions: Vec<SessionSummary>,
+    active_session: SessionSnapshot,
+    history: HistoryStore,
+    write_lock: Arc<Mutex<()>>,
+    listener: Option<ChangeListener>,
+}
+
 /// Serializes a session snapshot under the store lock and prepares it for an off-runtime write.
-fn prepare_session_write(inner: &mut Inner, session_id: &str) -> Result<PreparedWrite, AppError> {
+/// A tombstoned session yields no write so a deletion is never undone by an older flush.
+fn prepare_session_write(
+    inner: &mut Inner,
+    store: &Arc<Mutex<Inner>>,
+    session_id: &str,
+) -> Result<Option<PreparedWrite>, AppError> {
     if let Some(handle) = inner.timers.remove(session_id) {
         handle.abort();
+    }
+
+    if inner.deleting.contains(session_id) {
+        inner.dirty.remove(session_id);
+        return Ok(None);
     }
 
     let Some(messages) = inner.messages.get(session_id).cloned() else {
@@ -124,13 +169,14 @@ fn prepare_session_write(inner: &mut Inner, session_id: &str) -> Result<Prepared
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     );
 
-    Ok(PreparedWrite {
+    Ok(Some(PreparedWrite {
+        store: Arc::clone(store),
         history: inner.history.clone(),
         write_lock,
         session_id: session_id.to_owned(),
         session_bytes,
         index_bytes,
-    })
+    }))
 }
 
 impl SessionStore {
@@ -149,6 +195,7 @@ impl SessionStore {
                 dirty: HashSet::new(),
                 timers: HashMap::new(),
                 write_locks: HashMap::new(),
+                deleting: HashSet::new(),
                 index_dirty: false,
                 warnings: Vec::new(),
                 listener: None,
@@ -300,6 +347,233 @@ impl SessionStore {
         Ok(snapshot)
     }
 
+    /// Renames a session without touching its timestamps or position in the list.
+    pub async fn rename(&self, session_id: &str, title: &str) -> Result<SessionSummary, AppError> {
+        let normalized = normalize_title(title)?;
+
+        let (summary, previous, listener) = {
+            let mut inner = self.inner.lock().await;
+            let (summary, previous) = {
+                let session = inner
+                    .index
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(format!("Session \"{session_id}\" does not exist."))
+                    })?;
+                let previous = (session.title.clone(), session.custom_title);
+                session.title = normalized.clone();
+                session.custom_title = true;
+                (session.clone(), previous)
+            };
+            inner.index_dirty = true;
+            (summary, previous, inner.listener.clone())
+        };
+
+        if let Err(error) = flush_index(&self.inner).await {
+            let mut inner = self.inner.lock().await;
+            if let Some(session) = inner
+                .index
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+            {
+                if session.title == normalized && session.custom_title {
+                    session.title = previous.0;
+                    session.custom_title = previous.1;
+                }
+            }
+            inner.index_dirty = true;
+            return Err(error);
+        }
+
+        notify(listener);
+        Ok(summary)
+    }
+
+    /// Deletes a session and returns the remaining list with the newly active session.
+    pub async fn delete(&self, session_id: &str) -> Result<SessionDeletionResult, AppError> {
+        let plan = {
+            let mut inner = self.inner.lock().await;
+
+            ensure_session(&inner, session_id)?;
+
+            let previous_index = inner.index.clone();
+            let previous_index_dirty = inner.index_dirty;
+            let previous_usage = inner.usage.clone();
+            let previous_dirty = inner.dirty.clone();
+            let cached_before: HashSet<String> = inner.messages.keys().cloned().collect();
+            let deleted_messages = inner.messages.get(session_id).cloned();
+
+            if let Some(handle) = inner.timers.remove(session_id) {
+                handle.abort();
+            }
+            inner.deleting.insert(session_id.to_owned());
+
+            inner
+                .index
+                .sessions
+                .retain(|session| session.id != session_id);
+            inner.messages.remove(session_id);
+            inner.usage.retain(|id| id != session_id);
+            inner.dirty.remove(session_id);
+
+            let mut replacement_id = None;
+            let mut replacement_bytes = None;
+            if inner.index.sessions.is_empty() {
+                let session = build_session(&inner);
+                replacement_id = Some(session.id.clone());
+                inner.index.sessions.push(session);
+                inner.index.active_session_id = replacement_id.clone();
+                let id = replacement_id.clone().expect("replacement id");
+                cache_messages(&mut inner, &id, Vec::new());
+                replacement_bytes =
+                    Some(HistoryStore::session_document(&id, &[]).map_err(history_save_error)?);
+            }
+
+            let active_is_valid = inner
+                .index
+                .active_session_id
+                .as_ref()
+                .is_some_and(|active| {
+                    inner
+                        .index
+                        .sessions
+                        .iter()
+                        .any(|session| &session.id == active)
+                });
+            if !active_is_valid {
+                let mut remaining = inner.index.sessions.clone();
+                remaining.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                let next = remaining
+                    .first()
+                    .map(|session| session.id.clone())
+                    .ok_or_else(|| AppError::internal("No session is available."))?;
+                inner.index.active_session_id = Some(next);
+            }
+
+            let active_id = inner
+                .index
+                .active_session_id
+                .clone()
+                .ok_or_else(|| AppError::internal("No active session is available."))?;
+            load_session_locked(&mut inner, &active_id);
+            let active_session = snapshot_locked(&inner, &active_id)?;
+
+            let mut sessions = inner.index.sessions.clone();
+            sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            inner.index_dirty = true;
+            let index_bytes =
+                HistoryStore::index_document(&inner.index).map_err(history_save_error)?;
+
+            let write_lock = Arc::clone(
+                inner
+                    .write_locks
+                    .entry(session_id.to_owned())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            );
+
+            DeletionPlan {
+                session_id: session_id.to_owned(),
+                previous_index,
+                previous_index_dirty,
+                previous_usage,
+                previous_dirty,
+                cached_before,
+                deleted_messages,
+                replacement_id,
+                replacement_bytes,
+                index_bytes,
+                sessions,
+                active_session,
+                history: inner.history.clone(),
+                write_lock,
+                listener: inner.listener.clone(),
+            }
+        };
+
+        let _guard = plan.write_lock.lock().await;
+        let history = plan.history.clone();
+        let index_path = history.index_path();
+        let index_bytes = plan.index_bytes.clone();
+        let replacement = plan
+            .replacement_id
+            .clone()
+            .zip(plan.replacement_bytes.clone());
+
+        let write_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            if let Some((id, bytes)) = replacement {
+                write_document(&history.session_path(&id), &bytes)?;
+            }
+            write_document(&index_path, &index_bytes)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::internal(format!("The history writer failed. ({error})")))?
+        .map_err(history_save_error);
+
+        if let Err(error) = write_result {
+            let replacement_path = plan
+                .replacement_id
+                .as_ref()
+                .map(|id| plan.history.session_path(id));
+            {
+                let mut inner = self.inner.lock().await;
+                inner.index = plan.previous_index;
+                inner.index_dirty = plan.previous_index_dirty;
+                inner.usage = plan.previous_usage;
+                inner.dirty = plan.previous_dirty;
+
+                let stale: Vec<String> = inner
+                    .messages
+                    .keys()
+                    .filter(|id| !plan.cached_before.contains(*id))
+                    .cloned()
+                    .collect();
+                for id in stale {
+                    inner.messages.remove(&id);
+                }
+                if let Some(messages) = plan.deleted_messages {
+                    inner.messages.insert(plan.session_id.clone(), messages);
+                }
+                inner.deleting.remove(&plan.session_id);
+            }
+            if let Some(path) = replacement_path {
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+            }
+            return Err(error);
+        }
+
+        let transcript_path = plan.history.session_path(&plan.session_id);
+        let removal =
+            tokio::task::spawn_blocking(move || std::fs::remove_file(transcript_path)).await;
+        let removal_error = match removal {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(error) = removal_error {
+                push_warning(
+                    &mut inner,
+                    format!("Chat history for the deleted session could not be removed. ({error})"),
+                );
+            }
+            inner.deleting.remove(&plan.session_id);
+            inner.index_dirty = false;
+        }
+        notify(plan.listener);
+
+        Ok(SessionDeletionResult {
+            sessions: plan.sessions,
+            active_session: plan.active_session,
+        })
+    }
+
     pub async fn append_user_message(
         &self,
         session_id: &str,
@@ -335,7 +609,9 @@ impl SessionStore {
                     .iter_mut()
                     .find(|session| session.id == session_id)
                 {
-                    session.title = derive_title(text);
+                    if !session.custom_title {
+                        session.title = derive_title(text);
+                    }
                 }
             }
             touch_session(&mut inner, session_id, &created_at);
@@ -525,6 +801,7 @@ fn build_session(inner: &Inner) -> SessionSummary {
         title: FALLBACK_TITLE.to_owned(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
+        custom_title: false,
     }
 }
 
@@ -688,7 +965,10 @@ fn schedule_save(inner: &mut Inner, store: &Arc<Mutex<Inner>>, session_id: &str)
 async fn flush_session(store: &Arc<Mutex<Inner>>, session_id: &str) -> Result<(), AppError> {
     let prepared = {
         let mut inner = store.lock().await;
-        prepare_session_write(&mut inner, session_id)?
+        prepare_session_write(&mut inner, store, session_id)?
+    };
+    let Some(prepared) = prepared else {
+        return Ok(());
     };
 
     let result = prepared.execute().await;
@@ -739,6 +1019,22 @@ fn notify(listener: Option<ChangeListener>) {
     if let Some(listener) = listener {
         listener();
     }
+}
+
+/// Trims a user supplied title and enforces the shared storage limit.
+pub fn normalize_title(title: &str) -> Result<String, AppError> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::configuration(
+            "The session title cannot be empty.",
+        ));
+    }
+    if trimmed.chars().count() > TITLE_LIMIT {
+        return Err(AppError::configuration(format!(
+            "The session title must be at most {TITLE_LIMIT} characters."
+        )));
+    }
+    Ok(trimmed.to_owned())
 }
 
 pub fn derive_title(text: &str) -> String {
@@ -1182,6 +1478,350 @@ mod tests {
             .await
             .expect_err("missing session");
         assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn normalizes_user_titles_and_enforces_the_limit() {
+        assert_eq!(
+            normalize_title("  Rename me  ").expect("trimmed title"),
+            "Rename me"
+        );
+        assert_eq!(
+            normalize_title(&"x".repeat(TITLE_LIMIT))
+                .expect("exactly at the limit")
+                .chars()
+                .count(),
+            TITLE_LIMIT
+        );
+
+        for invalid in ["", "   ", "x".repeat(TITLE_LIMIT + 1).as_str()] {
+            let error = normalize_title(invalid).expect_err("invalid title");
+            assert_eq!(error.code, ErrorCode::Configuration);
+        }
+    }
+
+    #[tokio::test]
+    async fn renames_without_reordering_or_touching_timestamps() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let first = harness.store.get_active_session_id().await.expect("active");
+        let second = harness.store.create().await.expect("create");
+        let before = harness.store.list().await;
+        let first_before = before
+            .iter()
+            .find(|session| session.id == first)
+            .expect("first")
+            .clone();
+
+        let renamed = harness
+            .store
+            .rename(&first, "  Manual title  ")
+            .await
+            .expect("rename");
+
+        assert_eq!(renamed.title, "Manual title");
+        assert!(renamed.custom_title);
+        assert_eq!(renamed.updated_at, first_before.updated_at);
+        let after = harness.store.list().await;
+        assert_eq!(
+            after
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after[0].id, second.id);
+
+        let reopened = reopen(&harness.directory).await;
+        let restored = reopened
+            .list()
+            .await
+            .into_iter()
+            .find(|session| session.id == first)
+            .expect("renamed session");
+        assert_eq!(restored.title, "Manual title");
+        assert!(restored.custom_title);
+
+        let error = reopened
+            .rename("missing", "Nope")
+            .await
+            .expect_err("unknown session");
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn keeps_a_custom_title_when_the_first_message_arrives() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .rename(&session_id, "Manual title")
+            .await
+            .expect("rename");
+        harness
+            .store
+            .append_user_message(&session_id, "this must not become the title")
+            .await
+            .expect("append");
+
+        assert_eq!(harness.store.list().await[0].title, "Manual title");
+
+        let reopened = reopen(&harness.directory).await;
+        let snapshot = reopened.get_snapshot(&session_id).await.expect("snapshot");
+        assert_eq!(snapshot.session.title, "Manual title");
+        assert!(snapshot.session.custom_title);
+    }
+
+    #[tokio::test]
+    async fn restores_the_previous_title_when_the_index_write_fails() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .rename(&session_id, "Custom title")
+            .await
+            .expect("rename");
+
+        let history_dir = harness.directory.join("history");
+        let aside = harness.directory.join("history-aside");
+        fs::rename(&history_dir, &aside).expect("move history");
+        fs::write(&history_dir, b"not a directory").expect("block the directory");
+
+        harness
+            .store
+            .rename(&session_id, "Attempted title")
+            .await
+            .expect_err("index write fails");
+
+        let listed = harness.store.list().await;
+        assert_eq!(listed[0].title, "Custom title");
+        assert!(listed[0].custom_title);
+        assert!(harness.store.inner.lock().await.index_dirty);
+
+        fs::remove_file(&history_dir).expect("remove blocker");
+        fs::rename(&aside, &history_dir).expect("restore history");
+        harness.store.flush(&session_id).await.expect("retry flush");
+
+        let reopened = reopen(&harness.directory).await;
+        assert_eq!(reopened.list().await[0].title, "Custom title");
+    }
+
+    #[tokio::test]
+    async fn a_tombstoned_session_skips_a_prepared_write() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "keep me")
+            .await
+            .expect("append");
+
+        let store = Arc::clone(&harness.store.inner);
+        let mut inner = store.lock().await;
+        inner.deleting.insert(session_id.clone());
+        inner.dirty.insert(session_id.clone());
+        let prepared = prepare_session_write(&mut inner, &store, &session_id)
+            .expect("prepare")
+            .is_none();
+        assert!(prepared, "a tombstoned session produces no write");
+        assert!(!inner.dirty.contains(&session_id));
+    }
+
+    #[tokio::test]
+    async fn a_queued_write_does_not_recreate_a_deleted_transcript() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "delete me")
+            .await
+            .expect("append");
+
+        let store = Arc::clone(&harness.store.inner);
+        let prepared = {
+            let mut inner = store.lock().await;
+            prepare_session_write(&mut inner, &store, &session_id)
+                .expect("prepare")
+                .expect("write")
+        };
+
+        harness
+            .store
+            .delete(&session_id)
+            .await
+            .expect("delete session");
+        prepared.execute().await.expect("stale write is skipped");
+
+        let history = HistoryStore::new(harness.directory.join("history"));
+        assert!(!history.session_path(&session_id).exists());
+    }
+
+    #[tokio::test]
+    async fn deletes_an_inactive_session_and_returns_the_sorted_remainder() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let first = harness.store.get_active_session_id().await.expect("active");
+        let second = harness.store.create().await.expect("create");
+        let third = harness.store.create().await.expect("create");
+
+        let result = harness
+            .store
+            .delete(&second.id)
+            .await
+            .expect("delete inactive");
+
+        assert_eq!(
+            result
+                .sessions
+                .iter()
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>(),
+            vec![third.id.clone(), first.clone()]
+        );
+        assert_eq!(
+            result.active_session.session.id, third.id,
+            "an inactive deletion leaves the active session alone"
+        );
+        assert!(!harness.store.has_session(&second.id).await);
+        assert!(!HistoryStore::new(harness.directory.join("history"))
+            .session_path(&second.id)
+            .exists());
+
+        let reopened = reopen(&harness.directory).await;
+        assert_eq!(reopened.list().await.len(), 2);
+        assert!(!reopened.has_session(&second.id).await);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_active_session_selects_the_most_recently_updated_one() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let first = harness.store.get_active_session_id().await.expect("active");
+        harness.store.create().await.expect("second");
+        let third = harness.store.create().await.expect("third");
+        harness
+            .store
+            .append_user_message(&first, "most recent activity")
+            .await
+            .expect("append");
+        {
+            // Force the newly active transcript to be loaded from disk.
+            let mut inner = harness.store.inner.lock().await;
+            inner.messages.remove(&first);
+            inner.usage.retain(|id| id != &first);
+        }
+
+        let result = harness
+            .store
+            .delete(&third.id)
+            .await
+            .expect("delete active");
+
+        assert_eq!(result.active_session.session.id, first);
+        assert_eq!(result.active_session.messages.len(), 1);
+        assert_eq!(
+            result.active_session.messages[0].content,
+            "most recent activity"
+        );
+        assert_eq!(result.sessions[0].id, first);
+    }
+
+    #[tokio::test]
+    async fn deleting_the_only_session_creates_an_empty_active_fallback() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "gone")
+            .await
+            .expect("append");
+
+        let result = harness
+            .store
+            .delete(&session_id)
+            .await
+            .expect("delete only");
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_ne!(result.sessions[0].id, session_id);
+        assert_eq!(result.sessions[0].title, FALLBACK_TITLE);
+        assert_eq!(result.active_session.session.id, result.sessions[0].id);
+        assert!(result.active_session.messages.is_empty());
+        assert!(!HistoryStore::new(harness.directory.join("history"))
+            .session_path(&session_id)
+            .exists());
+
+        let reopened = reopen(&harness.directory).await;
+        assert_eq!(reopened.list().await.len(), 1);
+        assert!(reopened.get_warnings().await.is_empty());
+        assert!(reopened
+            .get_active_snapshot()
+            .await
+            .expect("snapshot")
+            .messages
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restores_the_index_when_a_delete_write_fails() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let first = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&first, "keep this transcript")
+            .await
+            .expect("append");
+        harness.store.create().await.expect("second");
+
+        let history_dir = harness.directory.join("history");
+        let aside = harness.directory.join("history-aside");
+        fs::rename(&history_dir, &aside).expect("move history");
+        fs::write(&history_dir, b"not a directory").expect("block the directory");
+
+        harness
+            .store
+            .delete(&first)
+            .await
+            .expect_err("index write fails");
+
+        assert!(harness.store.has_session(&first).await);
+        assert_eq!(harness.store.list().await.len(), 2);
+        let snapshot = harness
+            .store
+            .get_snapshot(&first)
+            .await
+            .expect("restored snapshot");
+        assert_eq!(snapshot.messages[0].content, "keep this transcript");
+
+        fs::remove_file(&history_dir).expect("remove blocker");
+        fs::rename(&aside, &history_dir).expect("restore history");
+
+        let reopened = reopen(&harness.directory).await;
+        assert!(reopened.has_session(&first).await);
+        assert_eq!(
+            reopened
+                .get_snapshot(&first)
+                .await
+                .expect("persisted snapshot")
+                .messages[0]
+                .content,
+            "keep this transcript"
+        );
+
+        harness.store.delete(&first).await.expect("retry delete");
+        assert!(!harness.store.has_session(&first).await);
+        assert!(!HistoryStore::new(&history_dir)
+            .session_path(&first)
+            .exists());
     }
 
     #[test]

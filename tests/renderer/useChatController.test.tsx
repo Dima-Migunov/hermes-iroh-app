@@ -62,6 +62,8 @@ const api = vi.hoisted(() => ({
   listSessions: vi.fn(),
   createSession: vi.fn(),
   activateSession: vi.fn(),
+  renameSession: vi.fn(),
+  deleteSession: vi.fn(),
   getSession: vi.fn(),
   getActiveSession: vi.fn(),
   getNotices: vi.fn(),
@@ -299,6 +301,172 @@ describe('useChatController session selection', () => {
     await flush()
 
     expect(controller.state.activeSessionId).toBe('session-a')
+  })
+})
+
+describe('useChatController session mutations', () => {
+  async function startGenerating(): Promise<void> {
+    api.sendPrompt.mockResolvedValue({ requestId: 'request-1' })
+    await act(async () => {
+      await controller.sendPrompt('hello')
+    })
+    await act(async () => {
+      promptHandlers[0]?.({
+        requestId: 'request-1',
+        type: 'start',
+        sessionId: 'session-a',
+      })
+    })
+    expect(controller.state.generating).toBe(true)
+  }
+
+  it('applies a successful rename without touching the active transcript', async () => {
+    await mount()
+    const renamed: SessionSummary = {
+      ...sessionA,
+      title: 'Renamed session',
+      customTitle: true,
+    }
+    api.renameSession.mockResolvedValue(renamed)
+
+    let succeeded = false
+    await act(async () => {
+      succeeded = await controller.renameSession('session-a', 'Renamed session')
+    })
+
+    expect(succeeded).toBe(true)
+    expect(api.renameSession).toHaveBeenCalledWith('session-a', 'Renamed session')
+    expect(controller.state.sessions[0]).toEqual(renamed)
+    expect(controller.state.activeSessionId).toBe('session-a')
+  })
+
+  it('surfaces a rename failure and leaves the previous title in place', async () => {
+    await mount()
+    api.renameSession.mockRejectedValue(new Error('rename failed'))
+
+    let succeeded = true
+    await act(async () => {
+      succeeded = await controller.renameSession('session-a', 'Renamed session')
+    })
+
+    expect(succeeded).toBe(false)
+    expect(controller.state.sessions[0]?.title).toBe('Session A')
+    expect(controller.state.notices.map((notice) => notice.message)).toEqual([
+      'rename failed',
+    ])
+  })
+
+  it('keeps a custom title when the first prompt is sent afterwards', async () => {
+    await mount()
+    const renamed: SessionSummary = {
+      ...sessionA,
+      title: 'Renamed session',
+      customTitle: true,
+    }
+    api.renameSession.mockResolvedValue(renamed)
+    api.sendPrompt.mockResolvedValue({ requestId: 'request-1' })
+
+    await act(async () => {
+      await controller.renameSession('session-a', 'Renamed session')
+    })
+    await act(async () => {
+      await controller.sendPrompt('this must not replace the title')
+    })
+    await act(async () => {
+      promptHandlers[0]?.({
+        requestId: 'request-1',
+        type: 'start',
+        sessionId: 'session-a',
+      })
+      promptHandlers[0]?.({
+        requestId: 'request-1',
+        type: 'done',
+        sessionId: 'session-a',
+      })
+    })
+
+    expect(controller.state.sessions[0]?.title).toBe('Renamed session')
+    expect(controller.state.sessions[0]?.customTitle).toBe(true)
+  })
+
+  it('does not rename while a response is generating', async () => {
+    await mount()
+    await startGenerating()
+
+    let succeeded = true
+    await act(async () => {
+      succeeded = await controller.renameSession('session-a', 'Renamed session')
+    })
+
+    expect(succeeded).toBe(false)
+    expect(api.renameSession).not.toHaveBeenCalled()
+  })
+
+  it('applies a deletion result and discards a pending activation', async () => {
+    await mount()
+    const pending = deferred<SessionSnapshot>()
+    api.activateSession.mockReturnValue(pending.promise)
+
+    let activation: Promise<void> | undefined
+    await act(async () => {
+      activation = controller.activateSession('session-b')
+    })
+
+    api.deleteSession.mockResolvedValue({
+      sessions: [sessionB],
+      activeSession: snapshotOf(sessionB),
+    })
+
+    let deleted = false
+    await act(async () => {
+      deleted = (await controller.deleteSession('session-a')) !== null
+    })
+
+    expect(deleted).toBe(true)
+    expect(controller.state.sessions.map((session) => session.id)).toEqual(['session-b'])
+    expect(controller.state.activeSessionId).toBe('session-b')
+
+    await act(async () => {
+      pending.resolve(snapshotOf(sessionB))
+    })
+    await flush()
+    await activation
+
+    expect(controller.state.activeSessionId).toBe('session-b')
+    expect(controller.state.sessions.map((session) => session.id)).toEqual(['session-b'])
+  })
+
+  it('keeps the session list when a deletion fails', async () => {
+    await mount()
+    api.deleteSession.mockRejectedValue(new Error('delete failed'))
+
+    let deleted = true
+    await act(async () => {
+      deleted = (await controller.deleteSession('session-a')) !== null
+    })
+
+    expect(deleted).toBe(false)
+    expect(controller.state.sessions.map((session) => session.id)).toEqual([
+      'session-a',
+      'session-b',
+    ])
+    expect(controller.state.activeSessionId).toBe('session-a')
+    expect(controller.state.notices.map((notice) => notice.message)).toEqual([
+      'delete failed',
+    ])
+  })
+
+  it('does not delete while a response is generating', async () => {
+    await mount()
+    await startGenerating()
+
+    let result = 'not-null'
+    await act(async () => {
+      result = (await controller.deleteSession('session-a')) === null ? 'null' : 'not-null'
+    })
+
+    expect(result).toBe('null')
+    expect(api.deleteSession).not.toHaveBeenCalled()
   })
 })
 

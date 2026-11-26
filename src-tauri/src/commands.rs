@@ -3,11 +3,11 @@ use serde_json::Value;
 use tauri::{State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::errors::AppError;
+use crate::errors::{AppError, ErrorCode};
 use crate::prompt::PromptSubmission;
 use crate::protocol::{
-    AppNotice, ClientConfig, ConnectionStatus, PromptSubmissionResult, SessionSnapshot,
-    SessionSummary,
+    AppNotice, ClientConfig, ConnectionStatus, PromptSubmissionResult, SessionDeletionResult,
+    SessionSnapshot, SessionSummary,
 };
 use crate::state::AppState;
 use crate::storage::config::normalize_config;
@@ -157,6 +157,13 @@ pub fn validate_session_id(session_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn parse_session_title(value: Value) -> Result<String, AppError> {
+    let title = value.as_str().ok_or_else(|| {
+        AppError::configuration("Invalid request: the session title must be a string.")
+    })?;
+    crate::sessions::normalize_title(title)
+}
+
 fn parse_prompt(payload: PromptPayload) -> Result<PromptSubmission, AppError> {
     validate_session_id(&payload.session_id)?;
     require_length(&payload.text, "text", 1, PROMPT_TEXT_LIMIT)?;
@@ -295,6 +302,36 @@ pub async fn sessions_get_active(
 ) -> Result<SessionSnapshot, AppError> {
     ensure_main_window(&window)?;
     state.sessions.get_active_snapshot().await
+}
+
+#[tauri::command]
+pub async fn sessions_rename(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: Value,
+    title: Value,
+) -> Result<SessionSummary, AppError> {
+    ensure_main_window(&window)?;
+    let session_id = parse_session_id(session_id)?;
+    let title = parse_session_title(title)?;
+    state.sessions.rename(&session_id, &title).await
+}
+
+#[tauri::command]
+pub async fn sessions_delete(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: Value,
+) -> Result<SessionDeletionResult, AppError> {
+    ensure_main_window(&window)?;
+    let session_id = parse_session_id(session_id)?;
+    if state.coordinator.is_busy().await {
+        return Err(AppError::new(
+            ErrorCode::Busy,
+            "A response is in progress. Wait for it to finish before deleting a session.",
+        ));
+    }
+    state.sessions.delete(&session_id).await
 }
 
 #[tauri::command]
@@ -447,6 +484,39 @@ mod tests {
             .code,
             ErrorCode::Configuration
         );
+    }
+
+    #[test]
+    fn registers_the_session_mutation_commands() {
+        let handlers = include_str!("lib.rs");
+
+        assert!(handlers.contains("commands::sessions_rename"));
+        assert!(handlers.contains("commands::sessions_delete"));
+    }
+
+    #[test]
+    fn parses_and_validates_session_titles() {
+        assert_eq!(
+            parse_session_title(json!("  Rename me  ")).expect("title"),
+            "Rename me"
+        );
+        assert_eq!(
+            parse_session_title(json!("x".repeat(crate::sessions::TITLE_LIMIT)))
+                .expect("exactly at the limit")
+                .chars()
+                .count(),
+            crate::sessions::TITLE_LIMIT
+        );
+
+        for value in [
+            json!(42),
+            json!(""),
+            json!("   "),
+            json!("x".repeat(crate::sessions::TITLE_LIMIT + 1)),
+        ] {
+            let error = parse_session_title(value).expect_err("invalid title");
+            assert_eq!(error.code, ErrorCode::Configuration);
+        }
     }
 
     #[test]

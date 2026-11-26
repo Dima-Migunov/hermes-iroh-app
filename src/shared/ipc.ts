@@ -3,6 +3,7 @@ import type {
   ClientConfig,
   ConnectionStatus,
   PromptEvent,
+  SessionDeletionResult,
   SessionSnapshot,
   SessionSummary,
 } from './protocol'
@@ -26,6 +27,8 @@ export interface IpcApi {
   listSessions(): Promise<SessionSummary[]>
   createSession(): Promise<SessionSummary>
   activateSession(id: string): Promise<SessionSnapshot>
+  renameSession(id: string, title: string): Promise<SessionSummary>
+  deleteSession(id: string): Promise<SessionDeletionResult>
   getSession(id: string): Promise<SessionSnapshot>
   getActiveSession(): Promise<SessionSnapshot>
   getNotices(): Promise<AppNotice[]>

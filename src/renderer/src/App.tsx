@@ -95,6 +95,16 @@ export default function App() {
     [sidebar, chat],
   )
 
+  const handleSessionRename = useCallback(
+    (id: string, title: string): Promise<boolean> => chat.renameSession(id, title),
+    [chat],
+  )
+
+  const handleSessionDelete = useCallback(
+    (id: string) => chat.deleteSession(id),
+    [chat],
+  )
+
   const handleSessionBackdrop = useCallback((): void => sidebar.close(), [sidebar])
   const handleCancel = useCallback((): void => {
     void cancelPrompt()
@@ -115,6 +125,8 @@ export default function App() {
         onToggle={sidebar.toggle}
         onCreate={handleSessionCreate}
         onSelect={handleSessionSelect}
+        onRename={handleSessionRename}
+        onDelete={handleSessionDelete}
         onSettings={openSettings}
         onBackdrop={handleSessionBackdrop}
       />

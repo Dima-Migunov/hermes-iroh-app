@@ -351,6 +351,7 @@ mod tests {
             title: "Chat".to_owned(),
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            custom_title: false,
         }
     }
 
@@ -380,6 +381,43 @@ mod tests {
 
         assert_eq!(loaded.index, index);
         assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn loads_an_index_without_custom_title_metadata() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        fs::write(
+            store.index_path(),
+            r#"{"version":1,"activeSessionId":"session-1","sessions":[{"id":"session-1","title":"Old chat","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}]}"#,
+        )
+        .expect("seed");
+
+        let loaded = store.load_index();
+
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.index.sessions.len(), 1);
+        assert!(!loaded.index.sessions[0].custom_title);
+        assert_eq!(loaded.index.sessions[0].title, "Old chat");
+    }
+
+    #[test]
+    fn round_trips_custom_title_metadata() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        let mut renamed = summary("session-1");
+        renamed.title = "Renamed".to_owned();
+        renamed.custom_title = true;
+        let index = HistoryIndex {
+            active_session_id: Some("session-1".to_owned()),
+            sessions: vec![renamed],
+        };
+
+        store.save_index(&index).expect("save");
+        let loaded = store.load_index();
+
+        assert_eq!(loaded.index, index);
+        assert!(loaded.index.sessions[0].custom_title);
     }
 
     #[test]

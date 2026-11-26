@@ -5,6 +5,7 @@ import type {
   ErrorCode,
   PromptEvent,
   ResponseMetadata,
+  SessionDeletionResult,
   SessionSnapshot,
   SessionSummary,
   StoredMessage,
@@ -73,6 +74,8 @@ export type ChatAction =
   | { type: 'sessions/set'; sessions: SessionSummary[] }
   | { type: 'session/created'; session: SessionSummary }
   | { type: 'session/activated'; snapshot: SessionSnapshot }
+  | { type: 'session/renamed'; session: SessionSummary }
+  | { type: 'session/deleted'; result: SessionDeletionResult }
   | {
       type: 'prompt/sent'
       sessionId: string
@@ -165,6 +168,38 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         activeSessionId: sessionId,
+        transcripts: cached.transcripts,
+        transcriptOrder: cached.transcriptOrder,
+        error: null,
+      }
+    }
+
+    case 'session/renamed':
+      return {
+        ...state,
+        sessions: state.sessions.map((session) =>
+          session.id === action.session.id ? action.session : session,
+        ),
+      }
+
+    case 'session/deleted': {
+      if (state.generating) return state
+      const remaining = new Set(action.result.sessions.map((session) => session.id))
+      const activeId = action.result.activeSession.session.id
+      const transcripts: Record<string, StoredMessage[]> = {}
+      for (const [id, messages] of Object.entries(state.transcripts)) {
+        if (remaining.has(id)) transcripts[id] = messages
+      }
+      const transcriptOrder = state.transcriptOrder.filter((id) => remaining.has(id))
+      const cached = rememberTranscript(
+        { ...state, transcripts, transcriptOrder, activeSessionId: activeId },
+        activeId,
+        action.result.activeSession.messages,
+      )
+      return {
+        ...state,
+        sessions: action.result.sessions,
+        activeSessionId: activeId,
         transcripts: cached.transcripts,
         transcriptOrder: cached.transcriptOrder,
         error: null,

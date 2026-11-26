@@ -60,6 +60,8 @@ pub fn run() {
             commands::sessions_activate,
             commands::sessions_get,
             commands::sessions_get_active,
+            commands::sessions_rename,
+            commands::sessions_delete,
             commands::prompt_send,
             commands::prompt_cancel,
             commands::clipboard_write,

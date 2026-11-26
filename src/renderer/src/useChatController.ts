@@ -4,6 +4,7 @@ import type {
   ErrorCode,
   PromptEvent,
   ResponseMetadata,
+  SessionDeletionResult,
   StoredMessage,
 } from '@shared/protocol'
 import { bridge } from './bridge'
@@ -42,6 +43,8 @@ export interface ChatController {
   cancelPrompt(): Promise<void>
   createSession(): Promise<void>
   activateSession(id: string): Promise<void>
+  renameSession(id: string, title: string): Promise<boolean>
+  deleteSession(id: string): Promise<SessionDeletionResult | null>
   saveAndConnect(config: ClientConfig): Promise<ClientConfig>
   copyText(text: string): Promise<void>
   dismissError(): void
@@ -300,6 +303,38 @@ export function useChatController(): ChatController {
     }
   }, [])
 
+  const renameSession = useCallback(async (id: string, title: string): Promise<boolean> => {
+    const api = bridge
+    if (stateRef.current.generating) return false
+    listSeq.current += 1
+    try {
+      const session = await api.renameSession(id, title)
+      dispatch({ type: 'session/renamed', session })
+      return true
+    } catch (error) {
+      dispatch({ type: 'notice/add', notice: { level: 'warning', message: messageOf(error) } })
+      return false
+    }
+  }, [])
+
+  const deleteSession = useCallback(
+    async (id: string): Promise<SessionDeletionResult | null> => {
+      const api = bridge
+      if (stateRef.current.generating) return null
+      selectionSeq.current += 1
+      listSeq.current += 1
+      try {
+        const result = await api.deleteSession(id)
+        dispatch({ type: 'session/deleted', result })
+        return result
+      } catch (error) {
+        dispatch({ type: 'notice/add', notice: { level: 'warning', message: messageOf(error) } })
+        return null
+      }
+    },
+    [],
+  )
+
   const saveAndConnect = useCallback(async (config: ClientConfig): Promise<ClientConfig> => {
     const api = bridge
     const saved = await api.saveConfig(config)
@@ -332,6 +367,8 @@ export function useChatController(): ChatController {
     cancelPrompt,
     createSession,
     activateSession,
+    renameSession,
+    deleteSession,
     saveAndConnect,
     copyText,
     dismissError,

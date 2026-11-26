@@ -1,8 +1,9 @@
-import { StrictMode, act } from 'react'
+import { StrictMode, act, type ReactElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { StoredMessage } from '@shared/protocol'
 import { Transcript } from '@renderer/components/Transcript'
+import { useTranscriptScroll } from '@renderer/useTranscriptScroll'
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 
@@ -49,23 +50,27 @@ function setMetrics(element: HTMLDivElement, scrollHeight: number, clientHeight:
   Object.defineProperty(element, 'scrollTop', { value: top, writable: true, configurable: true })
 }
 
-function render({ messages: value, sessionId = SESSION, strict = false }: RenderOptions): void {
+function mount(element: ReactElement): void {
   if (!root) {
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
   }
-  const transcript = (
-    <Transcript messages={value} generating={false} sessionId={sessionId} onCopy={noop} />
-  )
   act(() => {
-    root?.render(strict ? <StrictMode>{transcript}</StrictMode> : transcript)
+    root?.render(element)
   })
   const next = container!.querySelector<HTMLDivElement>('.transcript')
   if (next && next !== scroller) {
     Object.defineProperty(next, 'scrollTo', { value: scrollToSpy, configurable: true })
     scroller = next
   }
+}
+
+function render({ messages: value, sessionId = SESSION, strict = false }: RenderOptions): void {
+  const transcript = (
+    <Transcript messages={value} generating={false} sessionId={sessionId} onCopy={noop} />
+  )
+  mount(strict ? <StrictMode>{transcript}</StrictMode> : transcript)
 }
 
 function pendingFrames(): number {
@@ -118,6 +123,73 @@ function scrollbarAway(): void {
 
 function newMessagesButton(): HTMLButtonElement | null {
   return container!.querySelector<HTMLButtonElement>('.new-messages-button')
+}
+
+interface Probe {
+  jump: (id: string) => void
+  returnToLatest: () => void
+}
+
+let probe: Probe | null = null
+
+function ScrollProbe({
+  messages: value,
+  sessionId,
+}: {
+  messages: StoredMessage[]
+  sessionId: string | null
+}) {
+  const { containerRef, contentRef, onScroll, jumpToMessage, returnToLatest } = useTranscriptScroll(
+    value,
+    sessionId,
+  )
+  probe = { jump: jumpToMessage, returnToLatest }
+  return (
+    <div className="transcript" ref={containerRef} onScroll={onScroll}>
+      <div className="transcript-content" ref={contentRef}>
+        {value.map((item) => (
+          <div key={item.id} data-message-id={item.id}>
+            {item.content}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function renderProbe(options: RenderOptions): void {
+  probe = null
+  mount(
+    <ScrollProbe
+      messages={options.messages}
+      sessionId={options.sessionId === undefined ? SESSION : options.sessionId}
+    />,
+  )
+}
+
+function rectAt(top: number, height = 40): DOMRect {
+  return {
+    top,
+    bottom: top + height,
+    left: 0,
+    right: 100,
+    width: 100,
+    height,
+    x: 0,
+    y: top,
+    toJSON: () => ({}),
+  } as DOMRect
+}
+
+function place(element: Element, top: number): void {
+  Object.defineProperty(element, 'getBoundingClientRect', {
+    value: () => rectAt(top),
+    configurable: true,
+  })
+}
+
+function anchorElement(id: string): Element {
+  return container!.querySelector(`[data-message-id="${id}"]`)!
 }
 
 beforeEach(() => {
@@ -515,5 +587,113 @@ describe('strict mode and accessibility', () => {
     const label = newMessagesButton()?.getAttribute('aria-label')
     expect(label).toContain('New messages')
     expect(label).toContain('1')
+  })
+})
+
+describe('jumping to a message', () => {
+  it('scrolls a message to the top of the transcript with smooth motion', () => {
+    renderProbe({
+      messages: [
+        message('m1', 'one', 'user'),
+        message('m2', 'two'),
+        message('m3', 'three', 'user'),
+      ],
+    })
+    setPosition(100)
+    place(container!.querySelector('.transcript-content')!, 0)
+    place(anchorElement('m1'), 20)
+    place(anchorElement('m3'), 700)
+
+    act(() => probe!.jump('m3'))
+
+    expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 600, behavior: 'smooth' })
+  })
+
+  it('cancels an in-flight return instead of snapping back to the bottom', () => {
+    renderProbe({ messages: [message('m1', 'one', 'user'), message('m2', 'two')] })
+    setPosition(600)
+    runFrames()
+    setPosition(100)
+    act(() => {
+      scroller!.dispatchEvent(new Event('wheel'))
+      scroller!.dispatchEvent(new Event('scroll'))
+    })
+
+    act(() => probe!.returnToLatest())
+    expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 600, behavior: 'smooth' })
+
+    setPosition(300)
+    place(container!.querySelector('.transcript-content')!, 0)
+    place(anchorElement('m1'), 20)
+    act(() => probe!.jump('m1'))
+    expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 4, behavior: 'smooth' })
+
+    act(() => {
+      scroller!.dispatchEvent(new Event('scrollend'))
+    })
+    expect(scroller!.scrollTop).toBe(300)
+  })
+
+  it('keeps the jumped-to history position while content streams', () => {
+    renderProbe({ messages: [message('m1', 'one', 'user'), message('m2', 'two')] })
+    setPosition(600)
+    runFrames()
+    place(container!.querySelector('.transcript-content')!, 0)
+    place(anchorElement('m1'), 20)
+
+    act(() => probe!.jump('m1'))
+    setPosition(4)
+    act(() => {
+      scroller!.dispatchEvent(new Event('scrollend'))
+    })
+
+    renderProbe({ messages: [message('m1', 'one', 'user'), message('m2', 'two grew')] })
+    setPosition(4, 1200)
+    runFrames()
+
+    expect(scroller!.scrollTop).toBe(4)
+  })
+
+  it('keeps following when the jump lands near the bottom', () => {
+    renderProbe({ messages: [message('m1', 'one', 'user'), message('m2', 'two', 'user')] })
+    setPosition(600)
+    runFrames()
+    place(container!.querySelector('.transcript-content')!, 0)
+    place(anchorElement('m2'), 580)
+
+    act(() => probe!.jump('m2'))
+    expect(scrollToSpy).toHaveBeenLastCalledWith({ top: 564, behavior: 'smooth' })
+
+    setPosition(564)
+    act(() => {
+      scroller!.dispatchEvent(new Event('scrollend'))
+    })
+    runFrames()
+    expect(scroller!.scrollTop).toBe(600)
+
+    renderProbe({
+      messages: [
+        message('m1', 'one', 'user'),
+        message('m2', 'two', 'user'),
+        message('m3', 'three'),
+      ],
+    })
+    setPosition(600, 1200)
+    runFrames()
+    expect(scroller!.scrollTop).toBe(800)
+  })
+
+  it('jumps immediately under reduced motion', () => {
+    reducedMotion = true
+    renderProbe({ messages: [message('m1', 'one', 'user')] })
+    setPosition(600)
+    runFrames()
+    place(container!.querySelector('.transcript-content')!, 0)
+    place(anchorElement('m1'), 300)
+
+    act(() => probe!.jump('m1'))
+
+    expect(scrollToSpy).not.toHaveBeenCalled()
+    expect(scroller!.scrollTop).toBe(284)
   })
 })

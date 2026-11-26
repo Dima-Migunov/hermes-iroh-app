@@ -17,6 +17,7 @@ const DOCUMENTED_MEMBERS = [
   'connect',
   'copyText',
   'createSession',
+  'deleteSession',
   'disconnect',
   'getActiveSession',
   'getConfig',
@@ -29,6 +30,7 @@ const DOCUMENTED_MEMBERS = [
   'onHistoryChanged',
   'onNotice',
   'onPromptEvent',
+  'renameSession',
   'saveConfig',
   'sendPrompt',
 ]
@@ -52,6 +54,30 @@ describe('renderer bridge', () => {
       'connection_status',
       'sessions_list',
     ])
+  })
+
+  it('dispatches session renames with trimmed titles and deletions by id', async () => {
+    vi.mocked(invoke).mockResolvedValue({})
+
+    await bridge.renameSession('session-1', '  Renamed session  ')
+    await bridge.deleteSession('session-1')
+
+    expect(vi.mocked(invoke)).toHaveBeenNthCalledWith(1, 'sessions_rename', {
+      sessionId: 'session-1',
+      title: 'Renamed session',
+    })
+    expect(vi.mocked(invoke)).toHaveBeenNthCalledWith(2, 'sessions_delete', {
+      sessionId: 'session-1',
+    })
+  })
+
+  it('rejects empty rename fields before dispatch', async () => {
+    vi.mocked(invoke).mockClear()
+
+    await expect(bridge.renameSession('', 'Title')).rejects.toBeInstanceOf(TypeError)
+    await expect(bridge.renameSession('session-1', '   ')).rejects.toBeInstanceOf(TypeError)
+    await expect(bridge.deleteSession('')).rejects.toBeInstanceOf(TypeError)
+    expect(vi.mocked(invoke)).not.toHaveBeenCalled()
   })
 
   it('dispatches prompt cancellation with no arguments', async () => {

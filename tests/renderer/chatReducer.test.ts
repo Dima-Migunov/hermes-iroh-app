@@ -373,6 +373,105 @@ describe('chatReducer session handling', () => {
     expect(selectActiveMessages(state)).toEqual([])
     expect(state.sessions[0]?.id).toBe('session-b')
   })
+
+  it('replaces a renamed summary without reordering or changing the active session', () => {
+    let state = bootstrapped([message({ id: 'a-1', content: 'session A message' })])
+    state = chatReducer(state, { type: 'sessions/set', sessions: [sessionB, sessionA] })
+
+    const renamed: SessionSummary = {
+      ...sessionA,
+      title: 'Renamed session',
+      customTitle: true,
+    }
+    state = chatReducer(state, { type: 'session/renamed', session: renamed })
+
+    expect(state.sessions.map((session) => session.id)).toEqual(['session-b', 'session-a'])
+    expect(state.sessions[1]).toEqual(renamed)
+    expect(state.activeSessionId).toBe('session-a')
+    expect(selectActiveMessages(state)).toEqual([
+      message({ id: 'a-1', content: 'session A message' }),
+    ])
+  })
+
+  it('removes the deleted transcript and caches the returned active transcript', () => {
+    let state = bootstrapped([message({ id: 'a-1', content: 'session A message' })])
+    state = chatReducer(state, {
+      type: 'session/activated',
+      snapshot: {
+        session: sessionB,
+        messages: [message({ id: 'b-1', content: 'session B message' })],
+      },
+    })
+
+    state = chatReducer(state, {
+      type: 'session/deleted',
+      result: {
+        sessions: [sessionA],
+        activeSession: {
+          session: sessionA,
+          messages: [message({ id: 'a-1', content: 'session A message' })],
+        },
+      },
+    })
+
+    expect(state.sessions.map((session) => session.id)).toEqual(['session-a'])
+    expect(state.activeSessionId).toBe('session-a')
+    expect(state.transcripts['session-b']).toBeUndefined()
+    expect(state.transcriptOrder).not.toContain('session-b')
+    expect(selectActiveMessages(state).map((entry) => entry.content)).toEqual([
+      'session A message',
+    ])
+  })
+
+  it('keeps the remaining active transcript when an inactive session is deleted', () => {
+    let state = bootstrapped()
+    state = chatReducer(state, { type: 'sessions/set', sessions: [sessionB, sessionA] })
+    state = chatReducer(state, {
+      type: 'session/activated',
+      snapshot: {
+        session: sessionB,
+        messages: [message({ id: 'b-1', content: 'session B message' })],
+      },
+    })
+
+    state = chatReducer(state, {
+      type: 'session/deleted',
+      result: {
+        sessions: [sessionB],
+        activeSession: {
+          session: sessionB,
+          messages: [message({ id: 'b-1', content: 'session B message' })],
+        },
+      },
+    })
+
+    expect(state.sessions.map((session) => session.id)).toEqual(['session-b'])
+    expect(state.activeSessionId).toBe('session-b')
+    expect(state.transcripts['session-a']).toBeUndefined()
+    expect(selectActiveMessages(state)[0]?.content).toBe('session B message')
+  })
+
+  it('activates the empty fallback session after deleting the last session', () => {
+    const fallback: SessionSummary = {
+      id: 'session-new',
+      title: 'New chat',
+      createdAt: '2026-01-01T00:00:03.000Z',
+      updatedAt: '2026-01-01T00:00:03.000Z',
+    }
+    let state = bootstrapped([message({})])
+    state = chatReducer(state, {
+      type: 'session/deleted',
+      result: {
+        sessions: [fallback],
+        activeSession: { session: fallback, messages: [] },
+      },
+    })
+
+    expect(state.sessions).toEqual([fallback])
+    expect(state.activeSessionId).toBe('session-new')
+    expect(state.transcripts['session-a']).toBeUndefined()
+    expect(selectActiveMessages(state)).toEqual([])
+  })
 })
 
 describe('chatReducer cancellation', () => {

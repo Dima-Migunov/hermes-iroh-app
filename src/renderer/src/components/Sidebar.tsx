@@ -1,5 +1,5 @@
 import type { RefObject } from 'react'
-import type { ConnectionStatus, SessionSummary } from '@shared/protocol'
+import type { ConnectionStatus, SessionDeletionResult, SessionSummary } from '@shared/protocol'
 import brandBanner from '../assets/hermes-iroh-banner.png'
 import { connectionLabel } from '../connection'
 import { SessionList } from './SessionList'
@@ -17,6 +17,8 @@ interface SidebarProps {
   onToggle: () => void
   onCreate: () => void
   onSelect: (id: string) => void
+  onRename: (id: string, title: string) => Promise<boolean>
+  onDelete: (id: string) => Promise<SessionDeletionResult | null>
   onSettings: () => void
   onBackdrop: () => void
 }
@@ -34,6 +36,8 @@ export function Sidebar({
   onToggle,
   onCreate,
   onSelect,
+  onRename,
+  onDelete,
   onSettings,
   onBackdrop,
 }: SidebarProps) {
@@ -103,6 +107,8 @@ export function Sidebar({
             disabled={disabled}
             onCreate={onCreate}
             onSelect={onSelect}
+            onRename={onRename}
+            onDelete={onDelete}
           />
         </div>
 

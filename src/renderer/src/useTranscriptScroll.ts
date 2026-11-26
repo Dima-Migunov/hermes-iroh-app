@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { StoredMessage } from '@shared/protocol'
+import { MESSAGE_TOP_INSET_PX, messageScrollDestination } from './transcriptGeometry'
 
 export const FOLLOW_THRESHOLD_PX = 48
 
@@ -18,6 +19,7 @@ export interface TranscriptScroll {
   newMessageCount: number
   hasUnseenActivity: boolean
   returnToLatest: () => void
+  jumpToMessage: (id: string) => void
 }
 
 function prefersReducedMotion(): boolean {
@@ -34,6 +36,19 @@ function bottomOffset(container: HTMLDivElement): number {
 
 function distanceFromBottom(container: HTMLDivElement): number {
   return container.scrollHeight - container.scrollTop - container.clientHeight
+}
+
+function findMessageAnchor(content: HTMLElement, id: string): HTMLElement | null {
+  const anchors = content.querySelectorAll<HTMLElement>('[data-message-id]')
+  for (const anchor of anchors) {
+    if (anchor.dataset.messageId === id) return anchor
+  }
+  return null
+}
+
+/** Position of a message inside the scrollable content, independent of scroll. */
+function messageOffset(content: HTMLElement, anchor: HTMLElement): number {
+  return Math.max(0, anchor.getBoundingClientRect().top - content.getBoundingClientRect().top)
 }
 
 /**
@@ -123,6 +138,76 @@ export function useTranscriptScroll(
     followingRef.current = false
   }, [])
 
+  /**
+   * Single guarded smooth-scroll entry point. Cancels pending follow frames
+   * and any in-flight programmatic scroll before starting, and falls back to an
+   * instant assignment under reduced motion, at the target already, or when the
+   * engine cannot animate.
+   */
+  const scrollToTarget = useCallback(
+    (target: number): void => {
+      const container = containerRef.current
+      if (!container) return
+
+      const start = container.scrollTop
+      cancelFollowFrame()
+      clearProgrammaticScroll()
+
+      // An instant move needs no guard; it also keeps a submission while
+      // already at the bottom from swallowing the user's next scroll gesture.
+      if (
+        prefersReducedMotion() ||
+        Math.abs(start - target) <= 1 ||
+        typeof container.scrollTo !== 'function'
+      ) {
+        if (start !== target) container.scrollTop = target
+        return
+      }
+
+      scrollGenerationRef.current += 1
+      const generation = scrollGenerationRef.current
+      programmaticScrollRef.current = true
+
+      const onEnd = (): void => {
+        if (scrollGenerationRef.current !== generation) return
+        endProgrammaticScroll()
+      }
+      container.addEventListener('scrollend', onEnd)
+      programmaticCleanupRef.current = () => container.removeEventListener('scrollend', onEnd)
+
+      container.scrollTo({ top: target, behavior: 'smooth' })
+
+      // Fallback for engines without `scrollend`. Release only after the
+      // position has been stable for several frames, or at a generous cap.
+      let elapsed = 0
+      let stable = 0
+      let last = start
+      const tick = (): void => {
+        programmaticFrameRef.current = null
+        if (!programmaticScrollRef.current || scrollGenerationRef.current !== generation) return
+        elapsed += 1
+        if (elapsed >= MAX_PROGRAMMATIC_FRAMES) {
+          endProgrammaticScroll()
+          return
+        }
+        const current = container.scrollTop
+        if (Math.abs(current - last) < 1) {
+          stable += 1
+        } else {
+          stable = 0
+        }
+        last = current
+        if (elapsed >= MIN_STABLE_FRAMES && stable >= STABLE_PROGRAMMATIC_FRAMES) {
+          endProgrammaticScroll()
+          return
+        }
+        programmaticFrameRef.current = requestAnimationFrame(tick)
+      }
+      programmaticFrameRef.current = requestAnimationFrame(tick)
+    },
+    [cancelFollowFrame, clearProgrammaticScroll, endProgrammaticScroll],
+  )
+
   const returnToLatest = useCallback((): void => {
     followingRef.current = true
     setNewMessageCount(0)
@@ -131,63 +216,36 @@ export function useTranscriptScroll(
     const container = containerRef.current
     if (!container) return
 
-    const start = container.scrollTop
-    const target = bottomOffset(container)
-    cancelFollowFrame()
-    clearProgrammaticScroll()
+    scrollToTarget(bottomOffset(container))
+  }, [scrollToTarget])
 
-    // An instant return needs no guard; it also keeps a submission while
-    // already at the bottom from swallowing the user's next scroll gesture.
-    if (
-      prefersReducedMotion() ||
-      Math.abs(start - target) <= 1 ||
-      typeof container.scrollTo !== 'function'
-    ) {
-      if (start !== target) container.scrollTop = target
-      return
-    }
+  const jumpToMessage = useCallback(
+    (id: string): void => {
+      const container = containerRef.current
+      const content = contentRef.current
+      if (!container || !content) return
 
-    scrollGenerationRef.current += 1
-    const generation = scrollGenerationRef.current
-    programmaticScrollRef.current = true
+      const anchor = findMessageAnchor(content, id)
+      if (!anchor) return
 
-    const onEnd = (): void => {
-      if (scrollGenerationRef.current !== generation) return
-      endProgrammaticScroll()
-    }
-    container.addEventListener('scrollend', onEnd)
-    programmaticCleanupRef.current = () => container.removeEventListener('scrollend', onEnd)
+      const maxScroll = bottomOffset(container)
+      const target = messageScrollDestination(
+        messageOffset(content, anchor),
+        MESSAGE_TOP_INSET_PX,
+        maxScroll,
+      )
+      const keepsFollowing = maxScroll - target <= FOLLOW_THRESHOLD_PX
 
-    container.scrollTo({ top: target, behavior: 'smooth' })
-
-    // Fallback for engines without `scrollend`. Release only after the
-    // position has been stable for several frames, or at a generous cap.
-    let elapsed = 0
-    let stable = 0
-    let last = start
-    const tick = (): void => {
-      programmaticFrameRef.current = null
-      if (!programmaticScrollRef.current || scrollGenerationRef.current !== generation) return
-      elapsed += 1
-      if (elapsed >= MAX_PROGRAMMATIC_FRAMES) {
-        endProgrammaticScroll()
-        return
+      followingRef.current = keepsFollowing
+      if (keepsFollowing) {
+        setNewMessageCount(0)
+        setHasUnseenActivity(false)
       }
-      const current = container.scrollTop
-      if (Math.abs(current - last) < 1) {
-        stable += 1
-      } else {
-        stable = 0
-      }
-      last = current
-      if (elapsed >= MIN_STABLE_FRAMES && stable >= STABLE_PROGRAMMATIC_FRAMES) {
-        endProgrammaticScroll()
-        return
-      }
-      programmaticFrameRef.current = requestAnimationFrame(tick)
-    }
-    programmaticFrameRef.current = requestAnimationFrame(tick)
-  }, [cancelFollowFrame, clearProgrammaticScroll, endProgrammaticScroll])
+
+      scrollToTarget(target)
+    },
+    [scrollToTarget],
+  )
 
   useLayoutEffect(() => {
     const previous = knownLengthsRef.current
@@ -299,5 +357,6 @@ export function useTranscriptScroll(
     newMessageCount,
     hasUnseenActivity,
     returnToLatest,
+    jumpToMessage,
   }
 }

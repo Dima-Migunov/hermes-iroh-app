@@ -98,11 +98,17 @@ export interface SessionSummary {
   title: string
   createdAt: string
   updatedAt: string
+  customTitle?: boolean
 }
 
 export interface SessionSnapshot {
   session: SessionSummary
   messages: StoredMessage[]
+}
+
+export interface SessionDeletionResult {
+  sessions: SessionSummary[]
+  activeSession: SessionSnapshot
 }
 
 export interface ClientPromptFrame {

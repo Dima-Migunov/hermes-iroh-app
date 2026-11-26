@@ -1,7 +1,9 @@
 import type { WheelEvent } from 'react'
 import type { StoredMessage } from '@shared/protocol'
 import { useTranscriptScroll } from '../useTranscriptScroll'
+import { useUserMessageRail } from '../useUserMessageRail'
 import { MessageItem } from './MessageItem'
+import { UserMessageRail } from './UserMessageRail'
 
 interface TranscriptProps {
   messages: StoredMessage[]
@@ -18,7 +20,14 @@ export function Transcript({ messages, generating, sessionId, onCopy }: Transcri
     newMessageCount,
     hasUnseenActivity,
     returnToLatest,
+    jumpToMessage,
   } = useTranscriptScroll(messages, sessionId)
+  const { markers, railRight, railHeight } = useUserMessageRail(
+    messages,
+    sessionId,
+    containerRef,
+    contentRef,
+  )
 
   const showNewMessages = newMessageCount > 0 || hasUnseenActivity
   const label =
@@ -66,6 +75,15 @@ export function Transcript({ messages, generating, sessionId, onCopy }: Transcri
           )}
         </div>
       </div>
+
+      {markers.length > 0 ? (
+        <UserMessageRail
+          markers={markers}
+          railRight={railRight}
+          railHeight={railHeight}
+          onJump={jumpToMessage}
+        />
+      ) : null}
 
       {showNewMessages ? (
         <div className="transcript-nav" onWheel={handleNavWheel}>

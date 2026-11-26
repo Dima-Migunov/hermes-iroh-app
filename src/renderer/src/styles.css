@@ -348,10 +348,22 @@ textarea {
   font-weight: 600;
 }
 
-.stop-button {
+.stop-button,
+.danger-button {
   background: #3a1a1c;
   border-color: var(--danger);
   color: var(--danger);
+}
+
+.danger-button {
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.danger-button:hover:not(:disabled) {
+  filter: brightness(1.15);
 }
 
 .primary-button:hover:not(:disabled),
@@ -412,13 +424,21 @@ textarea:disabled {
   overflow-y: auto;
 }
 
+.session-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 54px;
+}
+
 .session-button {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
   width: 100%;
-  padding: 8px 10px;
+  padding: 8px 62px 8px 10px;
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
@@ -447,6 +467,152 @@ textarea:disabled {
 .session-time {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.session-actions {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 52px;
+  height: 28px;
+  transform: translateY(-50%);
+}
+
+.session-actions-trigger,
+.session-actions-menu {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.session-actions-trigger {
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.session-actions-trigger:hover:not(:disabled),
+.session-actions-trigger:focus-visible {
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
+.session-actions-menu {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(4px);
+}
+
+.session-actions--open .session-actions-trigger {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(4px);
+}
+
+.session-actions--open .session-actions-menu {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
+}
+
+.session-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-raised);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.session-icon-button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.session-icon-button--danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.session-rename {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 6px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel-raised);
+}
+
+.session-rename-input {
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 13px;
+}
+
+.session-rename-input:focus-visible {
+  border-color: var(--accent);
+}
+
+.session-rename-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.session-rename-error {
+  grid-column: 1 / -1;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.session-delete-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.session-delete-question {
+  font-size: 13px;
+}
+
+.session-delete-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.session-delete-cancel,
+.session-delete-confirm-button {
+  padding: 3px 8px;
+  font-size: 11px;
 }
 
 .sidebar-footer {
@@ -654,6 +820,84 @@ textarea:disabled {
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.25);
   font-variant-numeric: tabular-nums;
+}
+
+/* The rail is a sibling overlay of the scroller, so its markers never change
+   message width, padding, or scroll geometry. */
+.user-message-rail {
+  position: absolute;
+  top: 0;
+  z-index: 2;
+  width: 16px;
+  pointer-events: none;
+}
+
+.user-message-rail__marker {
+  position: absolute;
+  right: 0;
+  display: flex;
+  width: 16px;
+  height: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0;
+  border: none;
+  background: transparent;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.user-message-rail__line {
+  width: 10px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  opacity: 0.55;
+  transition: width 120ms ease, background 120ms ease, opacity 120ms ease;
+}
+
+.user-message-rail__marker:hover .user-message-rail__line,
+.user-message-rail__marker--active .user-message-rail__line {
+  width: 14px;
+  background: var(--accent);
+  opacity: 1;
+}
+
+.user-message-rail__marker:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+.user-message-rail__tooltip {
+  position: absolute;
+  right: calc(100% + 8px);
+  width: max-content;
+  max-height: 50%;
+  overflow: hidden;
+  padding: 8px 10px 20px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.user-message-rail__tooltip::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 20px;
+  background: linear-gradient(to bottom, transparent, var(--panel));
+  pointer-events: none;
 }
 
 .message-list {
@@ -948,7 +1192,15 @@ textarea:disabled {
   .brand-banner-wrap,
   .sidebar-sessions,
   .sidebar-toggle svg,
-  .new-messages-button {
+  .new-messages-button,
+  .session-actions-trigger,
+  .session-actions-menu {
+    transition: none;
+  }
+
+  .user-message-rail__marker,
+  .user-message-rail__line,
+  .user-message-rail__tooltip {
     transition: none;
   }
 
