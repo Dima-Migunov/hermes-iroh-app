@@ -554,15 +554,19 @@ git tag --delete v0.2.1
 10. Stop the server and send another prompt. Expected: the request fails with a timeout or
     connection error, the user message remains marked failed, and the composer becomes
     available again.
-11. Resize the window to 800×600 and tab through the sidebar **Settings** action, the settings
-    page controls, the session list, message copy buttons, and the composer. Expected: every
-    control is reachable, focus is visible, and the connection state is conveyed by text in the
-    settings status indicator and the window title as well as color.
+11. Create enough chats to overflow the session list, then resize the window to 800×600 and tab
+    through the sidebar **Settings** action, the settings page controls, the session list, message
+    copy buttons, and the composer. Expected: only the Sessions area scrolls; the brand and the
+    connection-status/**Settings** footer stay anchored. Every control is reachable, focus is
+    visible, and the connection state is conveyed by text in the settings status indicator and
+    the window title as well as color.
 12. Collapse the sidebar with the toggle, then expand it. Expected: the rail keeps the toggle,
-    status, and **Settings** reachable with the keyboard and removes session entries from the
-    accessibility tree; the toggle's accessible name changes between `Collapse sidebar` and
-    `Expand sidebar`. At 360 px and 720 px widths the sidebar starts as a drawer over a backdrop,
-    and selecting a session or the backdrop closes it. At 1180 px it starts expanded.
+    status, and **Settings** reachable with the keyboard, hides all session content, and removes
+    session entries from the accessibility tree; the toggle's accessible name changes between
+    `Collapse sidebar` and `Expand sidebar`. At 360 px and 720 px widths the sidebar starts as a
+    drawer over a backdrop. With enough sessions to overflow, only the Sessions area scrolls while
+    the drawer, brand, footer, and backdrop stay positioned; selecting a session or the backdrop
+    closes it. At 1180 px it starts expanded.
 13. Start a long response, then choose the stop button; repeat with `Escape`. Expected: the
     primary action shows the square stop icon while generating, the partial answer stays visible and
     is marked interrupted, no error banner appears, and another prompt can be sent immediately.
@@ -594,9 +598,12 @@ git tag --delete v0.2.1
    interrupted, and another prompt can be sent.
 6. Background the app mid-response, then return. Expected: the partial answer is saved as
    interrupted while suspended, and the app reconnects automatically when a target is configured.
-7. Rotate the device, open the on-screen keyboard, and expand and collapse the sidebar. Expected:
-   the composer stays above the keyboard and system bars, and the drawer closes on selection or
-   backdrop activation.
+7. Create enough chats to overflow the session list. Rotate the device, open the on-screen
+   keyboard, and expand and collapse the sidebar. Expected: only the Sessions area scrolls while
+   the brand and connection-status/**Settings** footer stay anchored; the composer stays above
+   the keyboard and system bars; and the drawer closes on selection or backdrop activation.
+   Collapsing to the rail hides all session content while keeping the toggle, status, and
+   **Settings** reachable.
 8. Force-stop and relaunch. Expected: the same client `NodeId` and session history are restored.
 9. Corrupt `client.key` and the history directory with `adb shell run-as
    com.number0.hermesirohapp`. Expected: the app stays open, shows a dismissible notice, and does
