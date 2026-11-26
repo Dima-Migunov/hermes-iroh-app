@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { androidPackages, androidSdkLevels, nodeVersion } from '../../scripts/toolchain.mjs'
 
 const root = join(import.meta.dirname, '..', '..')
 
@@ -13,28 +14,45 @@ async function text(path) {
 }
 
 describe('toolchain version policy', () => {
-  it('uses the latest stable Node.js in engines and every CI job', async () => {
-    const packageJson = await readJson('package.json')
-    expect(packageJson.engines.node).toBe('>=26.13.1')
+  it('single-sources the Node.js pin in .nvmrc', async () => {
+    const pin = nodeVersion()
+    expect(pin).toMatch(/^\d+\.\d+\.\d+$/)
 
-    const workflow = await text('.github/workflows/release.yml')
-    const nodeVersions = [...workflow.matchAll(/node-version:\s*(\S+)/g)].map(
-      (match) => match[1],
-    )
-    expect(nodeVersions).toEqual(['26.13.1', '26.13.1', '26.13.1', '26.13.1'])
+    const packageJson = await readJson('package.json')
+    expect(packageJson.engines.node).toBe(`>=${pin}`)
+
+    const container = await text('container/Dockerfile')
+    const arg = container.match(/ARG NODE_VERSION=(\S+)/)
+    expect(arg?.[1], 'the container Node.js ARG must match .nvmrc').toBe(pin)
   })
 
-  it('uses the latest stable Android toolchain in the Android job', async () => {
-    const workflow = await text('.github/workflows/release.yml')
+  it('derives the Android SDK levels from the committed Gradle project', async () => {
+    const levels = androidSdkLevels()
+    const gradle = await text('src-tauri/gen/android/app/build.gradle.kts')
 
-    expect(workflow).toContain('java-version: "21"')
-    expect(workflow).toContain('targets: aarch64-linux-android')
-    expect(workflow).toContain('platforms;android-37.0')
-    expect(workflow).toContain('platforms;android-37.2')
-    expect(workflow).toContain('build-tools;37.0.0')
-    expect(workflow).toContain('ndk;30.0.16248370')
-    expect(workflow).toContain('tauri android build --apk --target aarch64')
-    expect(workflow).toContain('apksigner" verify --print-certs')
+    expect(gradle).toContain(`compileSdk = ${levels.compileSdk}`)
+    expect(gradle).toContain(`minSdk = ${levels.minSdk}`)
+    expect(gradle).toContain(`targetSdk = ${levels.targetSdk}`)
+  })
+
+  it('keeps the Android packages single-sourced for CI and the container', async () => {
+    const packages = androidPackages()
+    const toolchain = await readJson('.toolchain.json')
+
+    expect(packages.platforms).toEqual(toolchain.androidPlatforms)
+    expect(packages.buildTools).toEqual(toolchain.androidBuildTools)
+    expect(packages.ndk).toBe(toolchain.androidNdk)
+
+    const workflow = await text('.github/workflows/release.yml')
+    expect(workflow).toContain('node scripts/toolchain.mjs sdkmanager')
+    expect(workflow).toContain('node scripts/toolchain.mjs ndk')
+    expect(workflow).not.toContain('platforms;android-')
+
+    const container = await text('container/Dockerfile')
+    expect(container).toContain('/tmp/.toolchain.json')
+    expect(container).not.toMatch(/platforms;android-37/)
+    expect(container).not.toMatch(/build-tools;37\.0\.0/)
+    expect(container).not.toMatch(/ndk;30\.0\./)
   })
 
   it('pins the latest stable iroh in the manifest and lockfile', async () => {
@@ -48,6 +66,6 @@ describe('toolchain version policy', () => {
 
   it('keeps the documented Node.js prerequisite in sync', async () => {
     const readme = await text('README.md')
-    expect(readme).toContain('Node.js ≥ 26.13.1')
+    expect(readme).toContain(`Node.js ≥ ${nodeVersion()}`)
   })
 })

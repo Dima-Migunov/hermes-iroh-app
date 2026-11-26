@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -37,18 +36,66 @@ pub struct PromptSubmission {
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveRequest {
-    pub request_id: String,
-    pub session_id: String,
+#[derive(Default)]
+struct RequestState {
+    assistant_message_id: Option<String>,
+    cancelled: bool,
+    terminal_sent: bool,
 }
 
 struct TrackedRequest {
     request_id: String,
     session_id: String,
-    assistant_message_id: std::sync::Mutex<Option<String>>,
-    cancelled: AtomicBool,
-    cancel: CancellationToken,
+    state: std::sync::Mutex<RequestState>,
+    cancellation: CancellationToken,
+    deltas: Arc<DeltaAccumulator>,
+}
+
+impl TrackedRequest {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RequestState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn publish_assistant(&self, message_id: String) -> bool {
+        let mut state = self.lock_state();
+        state.assistant_message_id = Some(message_id);
+        state.cancelled
+    }
+
+    fn assistant_id(&self) -> Option<String> {
+        self.lock_state().assistant_message_id.clone()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.lock_state().cancelled
+    }
+
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    /// Marks the request cancelled. Returns `false` when a terminal outcome was already
+    /// claimed, so cancellation never overrides a completed or failed request.
+    fn cancel(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.terminal_sent {
+            return false;
+        }
+        state.cancelled = true;
+        state.terminal_sent = true;
+        true
+    }
+
+    fn claim_terminal(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.cancelled || state.terminal_sent {
+            return false;
+        }
+        state.terminal_sent = true;
+        true
+    }
 }
 
 pub struct PromptCoordinator {
@@ -57,6 +104,7 @@ pub struct PromptCoordinator {
     events: Arc<dyn EventSink>,
     id_factory: IdFactory,
     active: Arc<Mutex<Option<Arc<TrackedRequest>>>>,
+    run_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PromptCoordinator {
@@ -72,22 +120,12 @@ impl PromptCoordinator {
             events,
             id_factory: id_factory.unwrap_or_else(|| Arc::new(|| Uuid::new_v4().to_string())),
             active: Arc::new(Mutex::new(None)),
+            run_task: Mutex::new(None),
         }
     }
 
     pub async fn is_busy(&self) -> bool {
         self.active.lock().await.is_some()
-    }
-
-    pub async fn get_active_request(&self) -> Option<ActiveRequest> {
-        self.active
-            .lock()
-            .await
-            .as_ref()
-            .map(|request| ActiveRequest {
-                request_id: request.request_id.clone(),
-                session_id: request.session_id.clone(),
-            })
     }
 
     pub async fn send_prompt(
@@ -115,9 +153,9 @@ impl PromptCoordinator {
             let request = Arc::new(TrackedRequest {
                 request_id: (self.id_factory)(),
                 session_id: input.session_id.clone(),
-                assistant_message_id: std::sync::Mutex::new(None),
-                cancelled: AtomicBool::new(false),
-                cancel: CancellationToken::new(),
+                state: std::sync::Mutex::new(RequestState::default()),
+                cancellation: CancellationToken::new(),
+                deltas: Arc::new(DeltaAccumulator::default()),
             });
             *active = Some(Arc::clone(&request));
             request
@@ -141,9 +179,10 @@ impl PromptCoordinator {
         let events = Arc::clone(&self.events);
         let active = Arc::clone(&self.active);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             run_prompt(client, sessions, events, active, request, input.text).await;
         });
+        *self.run_task.lock().await = Some(task);
 
         Ok(result)
     }
@@ -157,28 +196,83 @@ impl PromptCoordinator {
             return false;
         };
 
-        request.cancelled.store(true, Ordering::SeqCst);
-        request.cancel.cancel();
+        let won = request.cancel();
+        if !won {
+            return false;
+        }
+        request.cancellation().cancel();
         self.events.prompt_event(PromptEvent::Cancelled {
             request_id: request.request_id.clone(),
             session_id: request.session_id.clone(),
         });
 
-        let assistant_message_id = request
-            .assistant_message_id
-            .lock()
-            .expect("the assistant message lock is not poisoned")
-            .clone();
+        // Persist any text the run task has not drained yet so nothing already streamed is
+        // lost, then mark the message interrupted. The run task exits on the token.
+        let buffered = request.deltas.take();
+        let mut assistant_message_id = request.assistant_id();
+        if !buffered.is_empty() {
+            if assistant_message_id.is_none() {
+                if let Ok(message) = self
+                    .sessions
+                    .begin_assistant_message(&request.session_id)
+                    .await
+                {
+                    let _ = request.publish_assistant(message.id.clone());
+                    assistant_message_id = Some(message.id);
+                }
+            }
+            if let Some(message_id) = assistant_message_id.as_deref() {
+                self.sessions
+                    .append_delta(&request.session_id, message_id, &buffered)
+                    .await;
+            }
+        }
+
         let _ = self
             .sessions
             .interrupt_assistant(&request.session_id, assistant_message_id.as_deref())
             .await;
 
-        true
+        won
     }
 
     pub async fn shutdown(&self) -> Result<(), AppError> {
+        let _ = self.cancel_prompt().await;
+        // Let the run task persist its final state before the last flush.
+        if let Some(task) = self.run_task.lock().await.take() {
+            let _ = task.await;
+        }
         self.sessions.flush_all().await
+    }
+}
+
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Buffers streamed deltas so a slow consumer cannot make memory grow one frame at a time.
+#[derive(Default)]
+struct DeltaAccumulator {
+    pending: std::sync::Mutex<String>,
+    signal: tokio::sync::Notify,
+}
+
+impl DeltaAccumulator {
+    fn push(&self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_str(content);
+        self.signal.notify_one();
+    }
+
+    fn take(&self) -> String {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *pending)
     }
 }
 
@@ -191,18 +285,37 @@ async fn run_prompt(
     text: String,
 ) {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PromptEvent>();
+    let deltas = Arc::clone(&request.deltas);
+    let mut streamed_bytes = 0usize;
+    let mut overflowed = false;
 
     let transport_request = Arc::clone(&request);
+    let transport_deltas = Arc::clone(&deltas);
     let transport = tokio::spawn(async move {
+        let emit_deltas = transport_deltas;
+        let request_id = transport_request.request_id.clone();
+        let cancel = transport_request.cancellation().clone();
         client
             .stream_prompt(PromptStreamRequest {
                 request_id: transport_request.request_id.clone(),
                 session_id: transport_request.session_id.clone(),
                 text,
-                emit: Arc::new(move |event| {
-                    let _ = sender.send(event);
+                emit: Arc::new(move |event| match event {
+                    PromptEvent::Delta { content, .. } => emit_deltas.push(&content),
+                    other => {
+                        // Close the delta boundary before every control frame so the
+                        // consumer can never observe later text ahead of it.
+                        let buffered = emit_deltas.take();
+                        if !buffered.is_empty() {
+                            let _ = sender.send(PromptEvent::Delta {
+                                request_id: request_id.clone(),
+                                content: buffered,
+                            });
+                        }
+                        let _ = sender.send(other);
+                    }
                 }),
-                cancel: transport_request.cancel.clone(),
+                cancel,
             })
             .await;
     });
@@ -210,9 +323,88 @@ async fn run_prompt(
     let mut assistant_message_id: Option<String> = None;
     let mut terminal_seen = false;
 
-    while let Some(event) = receiver.recv().await {
-        if request.cancelled.load(Ordering::SeqCst) {
-            continue;
+    /// Persists buffered text into the assistant message without forwarding an event.
+    async fn drain_into_message(
+        deltas: &DeltaAccumulator,
+        sessions: &SessionStore,
+        session_id: &str,
+        assistant_message_id: Option<&str>,
+    ) {
+        let buffered = deltas.take();
+        if buffered.is_empty() {
+            return;
+        }
+        if let Some(message_id) = assistant_message_id {
+            sessions
+                .append_delta(session_id, message_id, &buffered)
+                .await;
+        }
+    }
+
+    // Emits accumulated text as one Delta event, in arrival order.
+    async fn emit_buffered(
+        buffered: String,
+        session_id: &str,
+        assistant_message_id: Option<&str>,
+        sessions: &SessionStore,
+        events: &Arc<dyn EventSink>,
+        request_id: &str,
+    ) {
+        if let Some(message_id) = assistant_message_id {
+            sessions
+                .append_delta(session_id, message_id, &buffered)
+                .await;
+        }
+        events.prompt_event(PromptEvent::Delta {
+            request_id: request_id.to_owned(),
+            content: buffered,
+        });
+    }
+
+    loop {
+        // Control frames are consumed first: the emitter always drains the accumulator and
+        // flushes a boundary Delta before sending a control frame, so nothing older can be
+        // left in the accumulator when a control frame is available.
+        let next = match receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                let buffered = deltas.take();
+                if !buffered.is_empty() {
+                    streamed_bytes = streamed_bytes.saturating_add(buffered.len());
+                    if streamed_bytes > MAX_RESPONSE_BYTES {
+                        overflowed = true;
+                        terminal_seen = true;
+                        break;
+                    }
+                    emit_buffered(
+                        buffered,
+                        &request.session_id,
+                        assistant_message_id.as_deref(),
+                        &sessions,
+                        &events,
+                        &request.request_id,
+                    )
+                    .await;
+                    continue;
+                }
+                if transport.is_finished() && receiver.is_closed() {
+                    break;
+                }
+                tokio::select! {
+                    event = receiver.recv() => event,
+                    _ = deltas.signal.notified() => continue,
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        };
+
+        let Some(event) = next else {
+            break;
+        };
+
+        if request.is_cancelled() {
+            // Leave buffered text for the post-loop drain.
+            break;
         }
 
         match event {
@@ -221,13 +413,22 @@ async fn run_prompt(
                     match sessions.begin_assistant_message(&session_id).await {
                         Ok(message) => {
                             assistant_message_id = Some(message.id.clone());
-                            *request
-                                .assistant_message_id
-                                .lock()
-                                .expect("the assistant message lock is not poisoned") =
-                                Some(message.id);
+                            if request.publish_assistant(message.id) {
+                                let _ = sessions
+                                    .interrupt_assistant(
+                                        &request.session_id,
+                                        assistant_message_id.as_deref(),
+                                    )
+                                    .await;
+                                terminal_seen = true;
+                                break;
+                            }
                         }
                         Err(error) => {
+                            if !request.claim_terminal() {
+                                terminal_seen = true;
+                                break;
+                            }
                             let message = error.message;
                             release_request(&active, &request).await;
                             events.prompt_event(PromptEvent::Error {
@@ -240,47 +441,59 @@ async fn run_prompt(
                                 .fail_request(&request.session_id, None, error.code, &message)
                                 .await;
                             terminal_seen = true;
-                            continue;
+                            break;
                         }
                     }
                 }
-
-                events.prompt_event(PromptEvent::Start {
-                    request_id: request.request_id.clone(),
-                    session_id,
-                });
-            }
-            PromptEvent::Delta { content, .. } => {
-                if let Some(message_id) = assistant_message_id.as_deref() {
-                    sessions
-                        .append_delta(&request.session_id, message_id, &content)
-                        .await;
+                if !request.is_cancelled() {
+                    events.prompt_event(PromptEvent::Start {
+                        request_id: request.request_id.clone(),
+                        session_id,
+                    });
                 }
-                events.prompt_event(PromptEvent::Delta {
-                    request_id: request.request_id.clone(),
-                    content,
-                });
             }
             PromptEvent::Done { metadata, .. } => {
-                release_request(&active, &request).await;
-                events.prompt_event(PromptEvent::Done {
-                    request_id: request.request_id.clone(),
-                    session_id: request.session_id.clone(),
-                    metadata: metadata.clone(),
-                });
+                if !request.claim_terminal() {
+                    terminal_seen = true;
+                    break;
+                }
+                drain_into_message(
+                    &deltas,
+                    &sessions,
+                    &request.session_id,
+                    assistant_message_id.as_deref(),
+                )
+                .await;
                 if let Some(message_id) = assistant_message_id.as_deref() {
                     let _ = sessions
                         .complete_assistant(
                             &request.session_id,
                             message_id,
-                            metadata.map(|value| *value),
+                            metadata.clone().map(|value| *value),
                         )
                         .await;
                 }
+                events.prompt_event(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata,
+                });
+                release_request(&active, &request).await;
                 terminal_seen = true;
+                break;
             }
             PromptEvent::Error { code, message, .. } => {
-                release_request(&active, &request).await;
+                if !request.claim_terminal() {
+                    terminal_seen = true;
+                    break;
+                }
+                drain_into_message(
+                    &deltas,
+                    &sessions,
+                    &request.session_id,
+                    assistant_message_id.as_deref(),
+                )
+                .await;
                 events.prompt_event(PromptEvent::Error {
                     request_id: request.request_id.clone(),
                     session_id: request.session_id.clone(),
@@ -295,13 +508,100 @@ async fn run_prompt(
                         &message,
                     )
                     .await;
+                release_request(&active, &request).await;
                 terminal_seen = true;
+                break;
+            }
+            PromptEvent::Delta { content, .. } => {
+                streamed_bytes = streamed_bytes.saturating_add(content.len());
+                if streamed_bytes > MAX_RESPONSE_BYTES {
+                    overflowed = true;
+                    terminal_seen = true;
+                    break;
+                }
+                emit_buffered(
+                    content,
+                    &request.session_id,
+                    assistant_message_id.as_deref(),
+                    &sessions,
+                    &events,
+                    &request.request_id,
+                )
+                .await;
             }
             PromptEvent::Cancelled { .. } => {}
         }
     }
 
-    if !request.cancelled.load(Ordering::SeqCst) && !terminal_seen {
+    // Drain whatever the accumulator still holds. Text that pushes the response past the
+    // cap turns into a protocol error; otherwise it is the final in-order text, and a
+    // cancelled response keeps it with the interrupted message.
+    if !overflowed {
+        let buffered = deltas.take();
+        if !buffered.is_empty() {
+            streamed_bytes = streamed_bytes.saturating_add(buffered.len());
+            if streamed_bytes > MAX_RESPONSE_BYTES {
+                overflowed = true;
+            } else if request.is_cancelled() {
+                if assistant_message_id.is_none() {
+                    if let Ok(message) = sessions.begin_assistant_message(&request.session_id).await
+                    {
+                        assistant_message_id = Some(message.id);
+                    }
+                }
+                if let Some(message_id) = assistant_message_id.as_deref() {
+                    sessions
+                        .append_delta(&request.session_id, message_id, &buffered)
+                        .await;
+                }
+            } else if !terminal_seen {
+                emit_buffered(
+                    buffered,
+                    &request.session_id,
+                    assistant_message_id.as_deref(),
+                    &sessions,
+                    &events,
+                    &request.request_id,
+                )
+                .await;
+            } else if let Some(message_id) = assistant_message_id.as_deref() {
+                // Text that arrived just before a terminal frame is persisted without a
+                // trailing event; the terminal frame already closed the renderer.
+                sessions
+                    .append_delta(&request.session_id, message_id, &buffered)
+                    .await;
+            }
+        }
+    }
+
+    if request.is_cancelled() && !overflowed {
+        let assistant_message_id = assistant_message_id.clone();
+        let _ = sessions
+            .interrupt_assistant(&request.session_id, assistant_message_id.as_deref())
+            .await;
+    }
+
+    if overflowed && request.claim_terminal() {
+        let code = ErrorCode::Protocol;
+        let message = format!("The response exceeded the {MAX_RESPONSE_BYTES}-byte limit.");
+        release_request(&active, &request).await;
+        events.prompt_event(PromptEvent::Error {
+            request_id: request.request_id.clone(),
+            session_id: request.session_id.clone(),
+            code,
+            message: message.clone(),
+        });
+        let _ = sessions
+            .fail_request(
+                &request.session_id,
+                assistant_message_id.as_deref(),
+                code,
+                &message,
+            )
+            .await;
+    }
+
+    if !request.is_cancelled() && !terminal_seen && !overflowed && request.claim_terminal() {
         let code = ErrorCode::Internal;
         let message = "The prompt ended without a terminal response from the server.";
         release_request(&active, &request).await;
@@ -565,10 +865,27 @@ pub mod tests {
             snapshot.messages[1].status,
             crate::protocol::MessageStatus::Complete
         );
+        let events = harness.sink.events();
         assert_eq!(
-            event_types(&harness.sink.events()),
-            vec!["start", "delta", "delta", "done"]
+            event_types(&events)[0],
+            "start",
+            "sequence: {:?}",
+            event_types(&events)
         );
+        assert_eq!(
+            event_types(&events).last(),
+            Some(&"done"),
+            "sequence: {:?}",
+            event_types(&events)
+        );
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                PromptEvent::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "Hello", "coalescing preserves ordered content");
 
         harness
             .coordinator
@@ -862,6 +1179,7 @@ pub mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         harness.coordinator.cancel_prompt().await;
+        harness.wait_until_idle().await;
 
         let snapshot = harness
             .sessions
@@ -875,11 +1193,11 @@ pub mod tests {
             .expect("assistant");
         assert_eq!(
             assistant.status,
-            crate::protocol::MessageStatus::Interrupted
+            crate::protocol::MessageStatus::Interrupted,
+            "snapshot: {snapshot:?}"
         );
-        assert_eq!(assistant.content, "kept");
+        assert_eq!(assistant.content, "kept", "snapshot: {snapshot:?}");
 
-        harness.wait_until_idle().await;
         let _ = std::fs::remove_dir_all(&harness.directory);
     }
 
@@ -945,6 +1263,443 @@ pub mod tests {
             .await
             .expect_err("missing session");
         assert_eq!(missing.code, ErrorCode::NotFound);
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_racing_the_first_frame_interrupts_the_new_message_once() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let published = Arc::new(tokio::sync::Notify::new());
+
+        let handler_started = Arc::clone(&started);
+        let handler_published = Arc::clone(&published);
+        let handler: TransportFn = Arc::new(move |request| {
+            let started = Arc::clone(&handler_started);
+            let published = Arc::clone(&handler_published);
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                started.notify_one();
+                published.notified().await;
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "late".to_owned(),
+                });
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+                request.cancel.cancelled().await;
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "race me".to_owned(),
+            })
+            .await
+            .expect("prompt");
+
+        started.notified().await;
+        assert!(harness.coordinator.cancel_prompt().await);
+        published.notify_one();
+
+        harness.wait_until_idle().await;
+
+        let events = harness.sink.events();
+        let cancelled = events
+            .iter()
+            .filter(|event| matches!(event, PromptEvent::Cancelled { .. }))
+            .count();
+        let done = events
+            .iter()
+            .filter(|event| matches!(event, PromptEvent::Done { .. }))
+            .count();
+        assert_eq!(cancelled, 1);
+        assert_eq!(done, 0);
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == crate::protocol::MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(
+            assistant.status,
+            crate::protocol::MessageStatus::Interrupted,
+            "a message published under cancellation must not stay streaming"
+        );
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_done_are_never_both_delivered_for_one_request() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler_release = Arc::clone(&release);
+        let handler: TransportFn = Arc::new(move |request| {
+            let release = Arc::clone(&handler_release);
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "partial".to_owned(),
+                });
+                release.notified().await;
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "cancel then done".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        for _ in 0..100 {
+            if harness
+                .sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, PromptEvent::Delta { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(harness.coordinator.cancel_prompt().await);
+        assert!(!harness.coordinator.cancel_prompt().await);
+        release.notify_one();
+        harness.wait_until_idle().await;
+
+        let events = harness.sink.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PromptEvent::Cancelled { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PromptEvent::Done { .. }))
+                .count(),
+            0
+        );
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == crate::protocol::MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(
+            assistant.status,
+            crate::protocol::MessageStatus::Interrupted
+        );
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_in_flight_prompt_and_writes_nothing_after_the_flush() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
+        let handler: TransportFn = Arc::new(move |request| {
+            let started = Arc::clone(&handler_started);
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "partial before quit".to_owned(),
+                });
+                started.notify_one();
+                request.cancel.cancelled().await;
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "quit mid-stream".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        started.notified().await;
+
+        harness.coordinator.shutdown().await.expect("shutdown");
+        harness.wait_until_idle().await;
+
+        let path = crate::storage::history::HistoryStore::new(harness.directory.join("history"))
+            .session_path(&harness.session_id);
+        let before = std::fs::read(&path).expect("read after flush");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let after = std::fs::read(&path).expect("read later");
+        assert_eq!(before, after, "no write may happen after the final flush");
+
+        let persisted: serde_json::Value = serde_json::from_slice(&after).expect("json");
+        let messages = persisted["messages"].as_array().expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|entry| entry["role"] == "assistant")
+            .expect("assistant");
+        assert_eq!(assistant["status"], "interrupted");
+        assert_eq!(assistant["content"], "partial before quit");
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+    #[tokio::test]
+    async fn coalesces_many_deltas_into_ordered_content() {
+        let handler: TransportFn = Arc::new(|request| {
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                for index in 0..500 {
+                    (request.emit)(PromptEvent::Delta {
+                        request_id: request.request_id.clone(),
+                        content: format!("{index},"),
+                    });
+                }
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "stream".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        harness.wait_until_idle().await;
+
+        let expected: String = (0..500).map(|index| format!("{index},")).collect();
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == crate::protocol::MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(assistant.content, expected);
+
+        let forwarded: String = harness
+            .sink
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                PromptEvent::Delta { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(forwarded, expected, "forwarded deltas keep arrival order");
+        assert!(
+            harness
+                .sink
+                .events()
+                .iter()
+                .filter(|event| matches!(event, PromptEvent::Delta { .. }))
+                .count()
+                < 500,
+            "deltas are coalesced instead of forwarded one per frame"
+        );
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn a_response_over_the_byte_cap_becomes_a_protocol_error() {
+        let chunk = "x".repeat(1024 * 1024);
+        let handler_chunk = chunk.clone();
+        let handler: TransportFn = Arc::new(move |request| {
+            let chunk = handler_chunk.clone();
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                for _ in 0..(MAX_RESPONSE_BYTES / chunk.len() + 2) {
+                    if request.cancel.is_cancelled() {
+                        return;
+                    }
+                    (request.emit)(PromptEvent::Delta {
+                        request_id: request.request_id.clone(),
+                        content: chunk.clone(),
+                    });
+                }
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "overflow".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        harness.wait_until_idle().await;
+
+        let events = harness.sink.events();
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                PromptEvent::Start { .. } => "start",
+                PromptEvent::Delta { .. } => "delta",
+                PromptEvent::Done { .. } => "done",
+                PromptEvent::Cancelled { .. } => "cancelled",
+                PromptEvent::Error { .. } => "error",
+            })
+            .collect();
+        let error = events
+            .iter()
+            .find(|event| matches!(event, PromptEvent::Error { .. }))
+            .unwrap_or_else(|| panic!("expected a protocol error, saw {kinds:?}"));
+        match error {
+            PromptEvent::Error { code, message, .. } => {
+                assert_eq!(*code, ErrorCode::Protocol);
+                assert!(
+                    message.contains("byte limit"),
+                    "unexpected overflow message: {message}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PromptEvent::Done { .. })),
+            "an overflowed response must not complete"
+        );
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        // The user message records the failure; any assistant message that exists must
+        // also be failed, and the request must not complete.
+        let user = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == crate::protocol::MessageRole::User)
+            .expect("user");
+        assert_eq!(user.status, crate::protocol::MessageStatus::Failed);
+        assert_eq!(
+            user.error.as_ref().map(|error| error.code.as_str()),
+            Some("protocol")
+        );
+        for assistant in snapshot
+            .messages
+            .iter()
+            .filter(|entry| entry.role == crate::protocol::MessageRole::Assistant)
+        {
+            assert_eq!(assistant.status, crate::protocol::MessageStatus::Failed);
+        }
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_stream_keeps_the_text_already_buffered() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler_release = Arc::clone(&release);
+        let handler: TransportFn = Arc::new(move |request| {
+            let release = Arc::clone(&handler_release);
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                for _ in 0..40 {
+                    (request.emit)(PromptEvent::Delta {
+                        request_id: request.request_id.clone(),
+                        content: "ab".to_owned(),
+                    });
+                }
+                release.notified().await;
+                request.cancel.cancelled().await;
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "cancel me".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(harness.coordinator.cancel_prompt().await);
+        release.notify_one();
+        harness.wait_until_idle().await;
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == crate::protocol::MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(
+            assistant.status,
+            crate::protocol::MessageStatus::Interrupted
+        );
+        assert!(
+            !assistant.content.is_empty() && assistant.content.len() % 2 == 0,
+            "buffered text is preserved: {:?}",
+            assistant.content
+        );
 
         let _ = std::fs::remove_dir_all(&harness.directory);
     }

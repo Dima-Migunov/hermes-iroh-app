@@ -13,12 +13,26 @@ interface ComposerProps {
 
 export function Composer({ disabled, generating, metadata, onSend, onStop }: ComposerProps) {
   const [text, setText] = useState('')
+  const [submitting, setSubmitting] = useState(false)
 
-  const submit = (): void => {
-    if (disabled || generating || !isSubmittable(text)) return
+  const submit = async (): Promise<void> => {
+    if (disabled || generating || submitting || !isSubmittable(text)) return
     const value = text
+    setSubmitting(true)
     setText('')
-    void onSend(value)
+
+    let started = false
+    try {
+      started = await onSend(value)
+    } catch {
+      started = false
+    } finally {
+      setSubmitting(false)
+    }
+
+    if (!started) {
+      setText((current) => (current.length > 0 ? current : value))
+    }
   }
 
   return (
@@ -26,7 +40,7 @@ export function Composer({ disabled, generating, metadata, onSend, onStop }: Com
       className="composer"
       onSubmit={(event) => {
         event.preventDefault()
-        submit()
+        void submit()
       }}
     >
       <label className="visually-hidden" htmlFor="composer-input">
@@ -45,7 +59,7 @@ export function Composer({ disabled, generating, metadata, onSend, onStop }: Com
             })
             if (action === 'send') {
               event.preventDefault()
-              submit()
+              void submit()
             }
           }}
           placeholder={disabled ? 'Waiting for a session…' : 'Ask the agent…'}

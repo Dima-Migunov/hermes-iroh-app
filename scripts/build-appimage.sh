@@ -33,15 +33,46 @@ if [ ! -f "$desktop_file" ]; then
   exit 1
 fi
 
+# Pinned appimagetool release instead of the movable `continuous` tag.
+APPIMAGETOOL_VERSION="${APPIMAGETOOL_VERSION:-1.9.1}"
+# SHA-256 digests published with the 1.9.1 release; override only to bump the pin.
+case "$image_arch" in
+  x86_64)
+    appimagetool_sha256="${APPIMAGETOOL_SHA256_X86_64:-ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0}"
+    ;;
+  aarch64)
+    appimagetool_sha256="${APPIMAGETOOL_SHA256_AARCH64:-f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158}"
+    ;;
+esac
+
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-iroh-app"
-tool="${APPIMAGETOOL:-$cache_dir/appimagetool-$image_arch.AppImage}"
+tool="${APPIMAGETOOL:-$cache_dir/appimagetool-$APPIMAGETOOL_VERSION-$image_arch.AppImage}"
+
+verify_tool() {
+  local path="$1"
+  if [ -z "$appimagetool_sha256" ]; then
+    echo "APPIMAGETOOL_SHA256_${image_arch} must be set so the tool can be verified." >&2
+    return 1
+  fi
+  local actual
+  actual="$(sha256sum "$path" | cut -d ' ' -f 1)"
+  if [ "$actual" != "$appimagetool_sha256" ]; then
+    echo "appimagetool checksum mismatch: expected $appimagetool_sha256, got $actual" >&2
+    return 1
+  fi
+}
 
 if [ ! -x "$tool" ]; then
   mkdir -p "$cache_dir"
-  url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$image_arch.AppImage"
+  url="https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$image_arch.AppImage"
   echo "Downloading $url"
-  curl -fsSL "$url" -o "$tool"
-  chmod +x "$tool"
+  temporary="$(mktemp "$cache_dir/appimagetool.XXXXXX")"
+  curl -fsSL "$url" -o "$temporary"
+  verify_tool "$temporary"
+  chmod +x "$temporary"
+  mv "$temporary" "$tool"
+else
+  verify_tool "$tool"
 fi
 
 appdir="$(mktemp -d)"
@@ -74,7 +105,11 @@ chmod +x "$appdir/AppRun"
 mkdir -p "$output_dir"
 output="$output_dir/hermes-iroh-app-$version-linux-$published_arch.AppImage"
 
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$image_arch" "$tool" "$appdir" "$output"
+# Write next to the destination, then rename, so a failed run never leaves a partial asset.
+temporary_output="$output.tmp"
+trap 'rm -rf "$appdir" "$temporary_output"' EXIT
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$image_arch" "$tool" "$appdir" "$temporary_output"
+mv "$temporary_output" "$output"
 
 size="$(stat -c '%s' "$output")"
 echo "Built $output ($size bytes)"

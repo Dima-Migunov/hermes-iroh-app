@@ -177,7 +177,7 @@ npm run tauri dev  # desktop window with Vite hot reload
 npm run typecheck  # TypeScript for the renderer and bridge
 npm test           # Vitest renderer and release-tooling tests
 npm run build      # compile the renderer into out/renderer
-npm run package    # build installers for the current platform into src-tauri/target
+npm run package    # build installers for the current platform into $CARGO_TARGET_DIR
 ```
 
 Android uses the same renderer and Rust backend:
@@ -453,10 +453,18 @@ A successful `done` frame may include `metadata` describing the turn. The server
 
 ## Publishing a release
 
+Pull requests and branch pushes run `.github/workflows/ci.yml`, which calls the reusable
+`.github/workflows/verify.yml`: type checking, the Vitest suite, the Rust tests, clippy,
+rustfmt, and the version-manifest check. The Linux build dependencies live in the
+`.github/actions/install-linux-deps` composite action, shared by both callers, so quality gates
+no longer depend on a release tag.
+
 The release workflow (`.github/workflows/release.yml`) runs on any tag matching `v*`:
 
-1. Bump `version` in `package.json` and run `npm run tauri:sync` so
-   `src-tauri/tauri.conf.json` matches. Commit both changes.
+1. Bump `version` in `package.json` and run `npm run tauri:sync`. It updates
+   `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `package-lock.json`, and the root entry
+   of `src-tauri/Cargo.lock`; `npm run tauri:check` is the read-only counterpart. Commit all of
+   them.
 2. Create and push a matching tag:
 
    ```bash
@@ -464,13 +472,23 @@ The release workflow (`.github/workflows/release.yml`) runs on any tag matching 
    git push origin v0.2.1
    ```
 
-3. The workflow fails before packaging when `npm run tauri:check` finds that the tag,
-   `package.json`, and `src-tauri/tauri.conf.json` disagree. On success it runs type checking,
-   the Vitest suite, the Rust tests, clippy, and rustfmt, builds Windows x64/arm64, macOS arm64,
-   Linux x64/arm64, and the Android arm64 APK, builds the minimal Linux AppImages with
-   `scripts/build-appimage.sh`, renames every artifact into the release contract, zips the
-   macOS application with `ditto`, and enforces the 25 MB installer budget. It then publishes
-   one release with all nine installers plus `SHA256SUMS.txt`.
+3. The workflow fails before packaging when `npm run tauri:check` finds that the tag and any of
+   those five files disagree. On success it runs the same reusable verification workflow, builds
+   Windows x64/arm64, macOS arm64, Linux x64/arm64, and the Android arm64 APK, builds the minimal
+   Linux AppImages with `scripts/build-appimage.sh`, renames every artifact into the release
+   contract, zips the macOS application with `ditto`, and enforces the 25 MB installer budget.
+   It resolves every bundle path from `CARGO_TARGET_DIR`, builds the renderer exactly once (via
+   `beforeBuildCommand`), and verifies the exact expected asset-name set with
+   `scripts/verify-release-assets.mjs` instead of counting extensions before it un-drafts the
+   release. It then publishes one release with all nine installers plus `SHA256SUMS.txt`.
+
+`scripts/release-assets.mjs` is the single source for asset naming and verification: the
+collection script, the size check, the tests, and the workflow verification all read the same
+table. A duplicate destination fails the run instead of silently dropping one of the artifacts,
+and the staging directory is cleared before every collection. `scripts/build-appimage.sh` pins
+the `appimagetool` release and verifies its SHA-256 (`APPIMAGETOOL_SHA256_X86_64` /
+`APPIMAGETOOL_SHA256_AARCH64`) before running it, writing to a temporary path and renaming on
+success.
 
 ### Android signing secrets
 

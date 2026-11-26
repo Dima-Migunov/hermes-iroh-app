@@ -166,11 +166,7 @@ impl ConfigStore {
             .as_object()
             .ok_or_else(|| AppError::configuration("The settings document must be an object."))?;
 
-        let config = normalize_config(&ClientConfig {
-            server_ticket: read_nullable_string(document.get("serverTicket"), "serverTicket")?,
-            server_node_id: read_nullable_string(document.get("serverNodeId"), "serverNodeId")?,
-            relay_url: read_nullable_string(document.get("relayUrl"), "relayUrl")?,
-        });
+        let config = parse_config_document(document, false)?;
 
         let mut extra = document.clone();
         extra.remove("version");
@@ -247,14 +243,46 @@ pub fn normalize_config(input: &ClientConfig) -> ClientConfig {
     }
 }
 
-fn read_nullable_string(value: Option<&Value>, field: &str) -> Result<Option<String>, AppError> {
+/// Reads one nullable string configuration field.
+///
+/// `required` distinguishes the IPC rule (the key must be present) from the disk rule
+/// (a missing key is treated as `null`, so a hand-edited file stays loadable).
+pub fn read_nullable_string(
+    value: Option<&Value>,
+    field: &str,
+    required: bool,
+) -> Result<Option<String>, AppError> {
     match value {
+        None if required => Err(AppError::configuration(format!(
+            "The settings field \"{field}\" is required and must be a string or null."
+        ))),
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(AppError::configuration(format!(
             "The settings field \"{field}\" must be a string or null."
         ))),
     }
+}
+
+/// Parses a configuration document with the shared rules for both IPC and disk loading.
+pub fn parse_config_document(
+    document: &Map<String, Value>,
+    required: bool,
+) -> Result<ClientConfig, AppError> {
+    let config = ClientConfig {
+        server_ticket: read_nullable_string(
+            document.get("serverTicket"),
+            "serverTicket",
+            required,
+        )?,
+        server_node_id: read_nullable_string(
+            document.get("serverNodeId"),
+            "serverNodeId",
+            required,
+        )?,
+        relay_url: read_nullable_string(document.get("relayUrl"), "relayUrl", required)?,
+    };
+    Ok(normalize_config(&config))
 }
 
 #[cfg(test)]
@@ -415,6 +443,56 @@ mod tests {
         assert_eq!(
             reloaded.load().config.server_ticket.as_deref(),
             ticket_config().server_ticket.as_deref()
+        );
+    }
+    #[test]
+    fn a_poisoned_caller_lock_does_not_prevent_reads_or_saves() {
+        use std::sync::Arc as StdArc;
+        use std::sync::RwLock;
+
+        let (file_path, mut store) = temporary_store(None);
+        store.save(ticket_config()).expect("initial save");
+        let shared = StdArc::new(RwLock::new(store));
+
+        let poisoner = StdArc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("write");
+            panic!("poison the configuration lock");
+        });
+        let poisoned = handle.join();
+        assert!(poisoned.is_err());
+        assert!(shared.is_poisoned());
+
+        let recovered = shared
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(recovered);
+
+        let reader = shared
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            reader.get_cached().server_ticket.as_deref(),
+            ticket_config().server_ticket.as_deref()
+        );
+        drop(reader);
+
+        let mut writer = shared
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = writer
+            .save(ClientConfig {
+                server_ticket: Some("after-poison".to_owned()),
+                server_node_id: None,
+                relay_url: None,
+            })
+            .expect("save after poison");
+        assert_eq!(saved.server_ticket.as_deref(), Some("after-poison"));
+
+        let mut reloaded = ConfigStore::new(&file_path);
+        assert_eq!(
+            reloaded.load().config.server_ticket.as_deref(),
+            Some("after-poison")
         );
     }
 }

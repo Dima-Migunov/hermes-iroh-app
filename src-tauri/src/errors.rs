@@ -18,6 +18,8 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// The wire string. Kept as the single definition and checked against the serde
+    /// representation by a test, so the two can never drift.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Busy => "busy",
@@ -247,5 +249,29 @@ mod tests {
         let error = server_error("the model is unavailable");
         assert_eq!(error.code, ErrorCode::Server);
         assert_eq!(error.message, "the model is unavailable");
+    }
+    #[test]
+    fn every_error_code_keeps_its_documented_wire_string() {
+        let expected = [
+            (ErrorCode::Busy, "busy"),
+            (ErrorCode::Timeout, "timeout"),
+            (ErrorCode::Network, "network"),
+            (ErrorCode::ConnectionClosed, "connection-closed"),
+            (ErrorCode::ConnectionRefused, "connection-refused"),
+            (ErrorCode::Protocol, "protocol"),
+            (ErrorCode::Server, "server"),
+            (ErrorCode::Identity, "identity"),
+            (ErrorCode::Configuration, "configuration"),
+            (ErrorCode::NotFound, "not-found"),
+            (ErrorCode::Internal, "internal"),
+        ];
+
+        for (code, wire) in expected {
+            assert_eq!(code.as_str(), wire);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize"),
+                serde_json::Value::String(wire.to_owned())
+            );
+        }
     }
 }

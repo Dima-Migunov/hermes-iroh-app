@@ -1,4 +1,6 @@
-FROM node:26.13.1-bookworm
+# The Node.js pin is single-sourced in `.nvmrc`; keep this ARG in sync with it.
+ARG NODE_VERSION=26.13.1
+FROM node:${NODE_VERSION}-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -40,11 +42,23 @@ RUN mkdir -p "$JAVA_HOME" \
   && rm /tmp/jdk.tgz \
   && java -version
 
+# Android pins come from `.toolchain.json`, the same single source CI reads.
+COPY .toolchain.json /tmp/.toolchain.json
+
 ENV ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
-    ANDROID_SDK_TOOLS_VERSION=15859902 \
-    ANDROID_NDK_VERSION=30.0.16248370 \
-    NDK_HOME=/opt/android-sdk/ndk/30.0.16248370
+    ANDROID_SDK_TOOLS_VERSION=15859902
+
+RUN node -e "
+  const t = require('/tmp/.toolchain.json')
+  const lines = [
+    'ANDROID_NDK_VERSION=' + t.androidNdk,
+    'ANDROID_PLATFORMS=' + t.androidPlatforms.join(' '),
+    'ANDROID_BUILD_TOOLS=' + t.androidBuildTools.join(' '),
+    'NDK_HOME=/opt/android-sdk/ndk/' + t.androidNdk,
+  ]
+  require('fs').writeFileSync('/tmp/android.env', lines.join('\\n') + '\\n')
+"
 ENV PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
 
 RUN curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_SDK_TOOLS_VERSION}_latest.zip" \
@@ -54,13 +68,15 @@ RUN curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-
   && mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest" \
   && rm /tmp/commandlinetools.zip \
   && yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null \
+  && . /tmp/android.env \
+  && for platform in $ANDROID_PLATFORMS; do \
+       "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-$platform"; \
+     done \
+  && for build_tools in $ANDROID_BUILD_TOOLS; do \
+       "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$build_tools"; \
+     done \
   && "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
       "platform-tools" \
-      "platforms;android-37.0" \
-      "platforms;android-37.2" \
-      "platforms;android-36" \
-      "build-tools;37.0.0" \
-      "build-tools;36.0.0" \
       "ndk;${ANDROID_NDK_VERSION}" \
   && chmod -R a+rwX "$ANDROID_HOME" \
   && /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --list_installed

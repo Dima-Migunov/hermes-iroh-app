@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,11 +11,13 @@ use crate::protocol::{
     MessageRole, MessageStatus, ResponseMetadata, SessionSnapshot, SessionSummary, StoredError,
     StoredMessage,
 };
-use crate::storage::history::{HistoryIndex, HistoryStore};
+use crate::storage::history::{write_document, HistoryIndex, HistoryStore};
 
 pub const FALLBACK_TITLE: &str = "New chat";
 const TITLE_LIMIT: usize = 60;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
+const MAX_CACHED_SESSIONS: usize = 5;
+const MAX_WARNINGS: usize = 20;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub type IdFactory = Arc<dyn Fn() -> String + Send + Sync>;
@@ -45,7 +47,13 @@ struct Inner {
     debounce: Duration,
     index: HistoryIndex,
     messages: HashMap<String, Vec<StoredMessage>>,
-    timers: HashMap<String, u64>,
+    /// Most-recently-used first. Only clean sessions (no timer, not dirty) are evicted.
+    usage: Vec<String>,
+    dirty: HashSet<String>,
+    timers: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// One write lock per session so writes never overlap or reorder.
+    write_locks: HashMap<String, Arc<Mutex<()>>>,
+    index_dirty: bool,
     warnings: Vec<String>,
     listener: Option<ChangeListener>,
 }
@@ -53,6 +61,76 @@ struct Inner {
 #[derive(Clone)]
 pub struct SessionStore {
     inner: Arc<Mutex<Inner>>,
+}
+
+/// Bytes to write after the store lock is released.
+struct PreparedWrite {
+    history: HistoryStore,
+    write_lock: Arc<Mutex<()>>,
+    session_id: String,
+    session_bytes: Vec<u8>,
+    index_bytes: Option<Vec<u8>>,
+}
+
+impl PreparedWrite {
+    async fn execute(self) -> Result<(), AppError> {
+        let _guard = self.write_lock.lock().await;
+        let PreparedWrite {
+            history,
+            session_id,
+            session_bytes,
+            index_bytes,
+            ..
+        } = self;
+
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            write_document(&history.session_path(&session_id), &session_bytes)?;
+            if let Some(bytes) = index_bytes {
+                write_document(&history.index_path(), &bytes)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::internal(format!("The history writer failed. ({error})")))?
+        .map_err(history_save_error)
+    }
+}
+
+/// Serializes a session snapshot under the store lock and prepares it for an off-runtime write.
+fn prepare_session_write(inner: &mut Inner, session_id: &str) -> Result<PreparedWrite, AppError> {
+    if let Some(handle) = inner.timers.remove(session_id) {
+        handle.abort();
+    }
+
+    let Some(messages) = inner.messages.get(session_id).cloned() else {
+        inner.dirty.remove(session_id);
+        return Err(AppError::internal(format!(
+            "Session \"{session_id}\" is not cached."
+        )));
+    };
+
+    let session_bytes =
+        HistoryStore::session_document(session_id, &messages).map_err(history_save_error)?;
+    let index_bytes = if inner.index_dirty {
+        Some(HistoryStore::index_document(&inner.index).map_err(history_save_error)?)
+    } else {
+        None
+    };
+
+    let write_lock = Arc::clone(
+        inner
+            .write_locks
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    );
+
+    Ok(PreparedWrite {
+        history: inner.history.clone(),
+        write_lock,
+        session_id: session_id.to_owned(),
+        session_bytes,
+        index_bytes,
+    })
 }
 
 impl SessionStore {
@@ -67,7 +145,11 @@ impl SessionStore {
                 debounce: options.debounce,
                 index: HistoryIndex::default(),
                 messages: HashMap::new(),
+                usage: Vec::new(),
+                dirty: HashSet::new(),
                 timers: HashMap::new(),
+                write_locks: HashMap::new(),
+                index_dirty: false,
                 warnings: Vec::new(),
                 listener: None,
             })),
@@ -79,23 +161,18 @@ impl SessionStore {
 
         let loaded = inner.history.load_index();
         if let Some(warning) = loaded.warning {
-            inner.warnings.push(warning);
+            push_warning(&mut inner, warning);
         }
         inner.index = loaded.index;
 
+        let mut initial_session = None;
         if inner.index.sessions.is_empty() {
             let session = build_session(&inner);
             inner.index.sessions.push(session.clone());
             inner.index.active_session_id = Some(session.id.clone());
-            inner.messages.insert(session.id.clone(), Vec::new());
-            inner
-                .history
-                .save_session(&session.id, &[])
-                .map_err(history_save_error)?;
-            inner
-                .history
-                .save_index(&inner.index)
-                .map_err(history_save_error)?;
+            cache_messages(&mut inner, &session.id, Vec::new());
+            inner.index_dirty = true;
+            initial_session = Some(session.id);
         }
 
         let active_is_valid = inner
@@ -116,18 +193,23 @@ impl SessionStore {
                 .sessions
                 .first()
                 .map(|session| session.id.clone());
+            inner.index_dirty = true;
         }
 
+        let mut recovered_active = None;
         if let Some(active) = inner.index.active_session_id.clone() {
-            load_session_locked(&mut inner, &active);
+            recovered_active = load_session_inner(&mut inner, &active);
+        }
+        drop(inner);
+
+        if let Some(active) = recovered_active {
+            let _ = flush_session(&self.inner, &active).await;
         }
 
-        inner
-            .history
-            .save_index(&inner.index)
-            .map_err(history_save_error)?;
-
-        Ok(())
+        if let Some(session_id) = initial_session {
+            flush_session(&self.inner, &session_id).await?;
+        }
+        flush_index(&self.inner).await
     }
 
     pub async fn get_warnings(&self) -> Vec<String> {
@@ -160,42 +242,45 @@ impl SessionStore {
     }
 
     pub async fn get_snapshot(&self, session_id: &str) -> Result<SessionSnapshot, AppError> {
-        let mut inner = self.inner.lock().await;
-        ensure_session(&inner, session_id)?;
-        load_session_locked(&mut inner, session_id);
-        snapshot_locked(&inner, session_id)
+        let snapshot = {
+            let mut inner = self.inner.lock().await;
+            ensure_session(&inner, session_id)?;
+            let recovered = load_session_inner(&mut inner, session_id);
+            let snapshot = snapshot_locked(&inner, session_id)?;
+            (snapshot, recovered)
+        };
+        if snapshot.1.is_some() {
+            let _ = flush_session(&self.inner, session_id).await;
+        }
+        Ok(snapshot.0)
     }
 
     pub async fn get_active_snapshot(&self) -> Result<SessionSnapshot, AppError> {
-        let mut inner = self.inner.lock().await;
-        let session_id = inner
+        let session_id = self
+            .inner
+            .lock()
+            .await
             .index
             .active_session_id
             .clone()
             .ok_or_else(|| AppError::not_found("No active session is available."))?;
-        ensure_session(&inner, &session_id)?;
-        load_session_locked(&mut inner, &session_id);
-        snapshot_locked(&inner, &session_id)
+        self.get_snapshot(&session_id).await
     }
 
     pub async fn create(&self) -> Result<SessionSummary, AppError> {
-        let (session, listener) = {
+        let (session, session_id, listener) = {
             let mut inner = self.inner.lock().await;
             let session = build_session(&inner);
             inner.index.sessions.push(session.clone());
             inner.index.active_session_id = Some(session.id.clone());
-            inner.messages.insert(session.id.clone(), Vec::new());
-            inner
-                .history
-                .save_session(&session.id, &[])
-                .map_err(history_save_error)?;
-            inner
-                .history
-                .save_index(&inner.index)
-                .map_err(history_save_error)?;
-            (session, inner.listener.clone())
+            cache_messages(&mut inner, &session.id, Vec::new());
+            inner.index_dirty = true;
+            let session_id = session.id.clone();
+            (session, session_id, inner.listener.clone())
         };
 
+        flush_session(&self.inner, &session_id).await?;
+        flush_index(&self.inner).await?;
         notify(listener);
         Ok(session)
     }
@@ -206,13 +291,11 @@ impl SessionStore {
             ensure_session(&inner, session_id)?;
             load_session_locked(&mut inner, session_id);
             inner.index.active_session_id = Some(session_id.to_owned());
-            inner
-                .history
-                .save_index(&inner.index)
-                .map_err(history_save_error)?;
+            inner.index_dirty = true;
             (snapshot_locked(&inner, session_id)?, inner.listener.clone())
         };
 
+        flush_index(&self.inner).await?;
         notify(listener);
         Ok(snapshot)
     }
@@ -256,24 +339,13 @@ impl SessionStore {
                 }
             }
             touch_session(&mut inner, session_id, &created_at);
-
-            let messages = inner
-                .messages
-                .get(session_id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            inner
-                .history
-                .save_session(session_id, messages)
-                .map_err(history_save_error)?;
-            inner
-                .history
-                .save_index(&inner.index)
-                .map_err(history_save_error)?;
+            inner.index_dirty = true;
 
             (message, inner.listener.clone())
         };
 
+        // The user message is durable before the prompt is sent.
+        flush_session(&self.inner, session_id).await?;
         notify(listener);
         Ok(message)
     }
@@ -303,6 +375,7 @@ impl SessionStore {
             .or_default()
             .push(message.clone());
         touch_session(&mut inner, session_id, &created_at);
+        inner.index_dirty = true;
         schedule_save(&mut inner, &self.inner, session_id);
 
         Ok(message)
@@ -329,10 +402,9 @@ impl SessionStore {
         message_id: &str,
         metadata: Option<ResponseMetadata>,
     ) -> Result<(), AppError> {
-        let listener = {
-            let mut inner = self.inner.lock().await;
-            let updated_at = now_iso(&inner);
-
+        self.mutate_and_flush(session_id, |inner| {
+            let updated_at = now_iso(inner);
+            touch_session(inner, session_id, &updated_at);
             if let Some(messages) = inner.messages.get_mut(session_id) {
                 if let Some(message) = messages.iter_mut().find(|entry| entry.id == message_id) {
                     message.status = MessageStatus::Complete;
@@ -341,14 +413,8 @@ impl SessionStore {
                     }
                 }
             }
-            touch_session(&mut inner, session_id, &updated_at);
-
-            flush_session_locked(&mut inner, session_id)?;
-            inner.listener.clone()
-        };
-
-        notify(listener);
-        Ok(())
+        })
+        .await
     }
 
     pub async fn interrupt_assistant(
@@ -356,10 +422,9 @@ impl SessionStore {
         session_id: &str,
         message_id: Option<&str>,
     ) -> Result<(), AppError> {
-        let listener = {
-            let mut inner = self.inner.lock().await;
-            let updated_at = now_iso(&inner);
-
+        self.mutate_and_flush(session_id, |inner| {
+            let updated_at = now_iso(inner);
+            touch_session(inner, session_id, &updated_at);
             if let Some(message_id) = message_id {
                 if let Some(messages) = inner.messages.get_mut(session_id) {
                     if let Some(message) = messages.iter_mut().find(|entry| entry.id == message_id)
@@ -368,14 +433,8 @@ impl SessionStore {
                     }
                 }
             }
-            touch_session(&mut inner, session_id, &updated_at);
-
-            flush_session_locked(&mut inner, session_id)?;
-            inner.listener.clone()
-        };
-
-        notify(listener);
-        Ok(())
+        })
+        .await
     }
 
     pub async fn fail_request(
@@ -385,8 +444,7 @@ impl SessionStore {
         code: ErrorCode,
         message: &str,
     ) -> Result<(), AppError> {
-        let listener = {
-            let mut inner = self.inner.lock().await;
+        self.mutate_and_flush(session_id, |inner| {
             let error = StoredError {
                 code: code.as_str().to_owned(),
                 message: message.to_owned(),
@@ -411,36 +469,51 @@ impl SessionStore {
                     user.error = Some(error);
                 }
             }
-
-            flush_session_locked(&mut inner, session_id)?;
-            inner.listener.clone()
-        };
-
-        notify(listener);
-        Ok(())
+        })
+        .await
     }
 
     pub async fn flush(&self, session_id: &str) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-        flush_session_locked(&mut inner, session_id)
+        flush_session(&self.inner, session_id).await
     }
 
     pub async fn flush_all(&self) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-        inner.timers.clear();
-        let session_ids: Vec<String> = inner.messages.keys().cloned().collect();
+        let session_ids: Vec<String> = self.inner.lock().await.messages.keys().cloned().collect();
+        let mut failures = Vec::new();
+
         for session_id in session_ids {
-            if let Some(messages) = inner.messages.get(&session_id) {
-                inner
-                    .history
-                    .save_session(&session_id, messages)
-                    .map_err(history_save_error)?;
+            if let Err(error) = flush_session(&self.inner, &session_id).await {
+                failures.push(error.message);
             }
         }
-        inner
-            .history
-            .save_index(&inner.index)
-            .map_err(history_save_error)?;
+        if let Err(error) = flush_index(&self.inner).await {
+            failures.push(error.message);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::internal(format!(
+                "Chat history could not be saved for {} session(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Applies one in-memory mutation, then persists the session.
+    async fn mutate_and_flush<F>(&self, session_id: &str, mutate: F) -> Result<(), AppError>
+    where
+        F: FnOnce(&mut Inner),
+    {
+        let listener = {
+            let mut inner = self.inner.lock().await;
+            mutate(&mut inner);
+            inner.listener.clone()
+        };
+
+        flush_session(&self.inner, session_id).await?;
+        notify(listener);
         Ok(())
     }
 }
@@ -485,14 +558,66 @@ fn touch_session(inner: &mut Inner, session_id: &str, timestamp: &str) {
     }
 }
 
-fn load_session_locked(inner: &mut Inner, session_id: &str) {
-    if inner.messages.contains_key(session_id) {
+fn push_warning(inner: &mut Inner, warning: String) {
+    inner.warnings.push(warning);
+    if inner.warnings.len() > MAX_WARNINGS {
+        let excess = inner.warnings.len() - MAX_WARNINGS;
+        inner.warnings.drain(..excess);
+    }
+}
+
+fn touch_usage(inner: &mut Inner, session_id: &str) {
+    inner.usage.retain(|id| id != session_id);
+    inner.usage.insert(0, session_id.to_owned());
+}
+
+fn is_clean(inner: &Inner, session_id: &str) -> bool {
+    !inner.dirty.contains(session_id) && !inner.timers.contains_key(session_id)
+}
+
+/// Caches a session transcript and evicts least recently used clean sessions past the cap.
+fn cache_messages(inner: &mut Inner, session_id: &str, messages: Vec<StoredMessage>) {
+    inner.messages.insert(session_id.to_owned(), messages);
+    touch_usage(inner, session_id);
+    evict_clean_sessions(inner);
+}
+
+fn evict_clean_sessions(inner: &mut Inner) {
+    if inner.messages.len() <= MAX_CACHED_SESSIONS {
         return;
+    }
+
+    let active = inner.index.active_session_id.clone();
+    let candidates: Vec<String> = inner
+        .usage
+        .iter()
+        .rev()
+        .filter(|id| Some(*id) != active.as_ref() && is_clean(inner, id))
+        .cloned()
+        .collect();
+
+    for session_id in candidates {
+        if inner.messages.len() <= MAX_CACHED_SESSIONS {
+            break;
+        }
+        inner.messages.remove(&session_id);
+        inner.usage.retain(|id| id != &session_id);
+    }
+}
+
+fn load_session_locked(inner: &mut Inner, session_id: &str) {
+    let _ = load_session_inner(inner, session_id);
+}
+
+fn load_session_inner(inner: &mut Inner, session_id: &str) -> Option<String> {
+    if inner.messages.contains_key(session_id) {
+        touch_usage(inner, session_id);
+        return None;
     }
 
     let loaded = inner.history.load_session(session_id);
     if let Some(warning) = loaded.warning {
-        inner.warnings.push(warning);
+        push_warning(inner, warning);
     }
 
     let mut recovered = false;
@@ -508,15 +633,13 @@ fn load_session_locked(inner: &mut Inner, session_id: &str) {
         })
         .collect();
 
-    inner.messages.insert(session_id.to_owned(), messages);
+    cache_messages(inner, session_id, messages);
     if recovered {
-        let messages = inner
-            .messages
-            .get(session_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let _ = inner.history.save_session(session_id, messages);
+        // Rewrite the recovered status to disk so a restart does not repeat the repair.
+        inner.dirty.insert(session_id.to_owned());
+        return Some(session_id.to_owned());
     }
+    None
 }
 
 fn snapshot_locked(inner: &Inner, session_id: &str) -> Result<SessionSnapshot, AppError> {
@@ -535,40 +658,77 @@ fn snapshot_locked(inner: &Inner, session_id: &str) -> Result<SessionSnapshot, A
 }
 
 fn schedule_save(inner: &mut Inner, store: &Arc<Mutex<Inner>>, session_id: &str) {
-    let generation = inner.timers.get(session_id).copied().unwrap_or(0) + 1;
-    inner.timers.insert(session_id.to_owned(), generation);
+    inner.dirty.insert(session_id.to_owned());
+    if let Some(handle) = inner.timers.remove(session_id) {
+        handle.abort();
+    }
 
     let store = Arc::clone(store);
-    let session_id = session_id.to_owned();
+    let owned_id = session_id.to_owned();
     let debounce = inner.debounce;
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         tokio::time::sleep(debounce).await;
-        let mut inner = store.lock().await;
-        if inner.timers.get(&session_id).copied() != Some(generation) {
-            return;
+        {
+            let mut inner = store.lock().await;
+            inner.timers.remove(&owned_id);
+            if !inner.dirty.contains(&owned_id) {
+                return;
+            }
         }
-        inner.timers.remove(&session_id);
-
-        let messages = inner.messages.get(&session_id).cloned().unwrap_or_default();
-        let _ = inner.history.save_session(&session_id, &messages);
-        let _ = inner.history.save_index(&inner.index);
+        // A failed debounce write keeps the session dirty for the next flush.
+        let _ = flush_session(&store, &owned_id).await;
+        let _ = flush_index(&store).await;
     });
+
+    inner.timers.insert(session_id.to_owned(), handle);
 }
 
-fn flush_session_locked(inner: &mut Inner, session_id: &str) -> Result<(), AppError> {
-    inner.timers.remove(session_id);
-    if let Some(messages) = inner.messages.get(session_id).cloned() {
-        inner
-            .history
-            .save_session(session_id, &messages)
-            .map_err(history_save_error)?;
+/// Persists one session: serialize under the store lock, then write off the runtime.
+async fn flush_session(store: &Arc<Mutex<Inner>>, session_id: &str) -> Result<(), AppError> {
+    let prepared = {
+        let mut inner = store.lock().await;
+        prepare_session_write(&mut inner, session_id)?
+    };
+
+    let result = prepared.execute().await;
+    let mut inner = store.lock().await;
+    match &result {
+        Ok(()) => {
+            inner.dirty.remove(session_id);
+            inner.index_dirty = false;
+            evict_clean_sessions(&mut inner);
+        }
+        Err(_) => {
+            // Keep the session dirty so a later flush retries it.
+            inner.dirty.insert(session_id.to_owned());
+        }
     }
-    inner
-        .history
-        .save_index(&inner.index)
-        .map_err(history_save_error)?;
-    Ok(())
+    result
+}
+
+async fn flush_index(store: &Arc<Mutex<Inner>>) -> Result<(), AppError> {
+    let prepared = {
+        let mut inner = store.lock().await;
+        if !inner.index_dirty {
+            return Ok(());
+        }
+        let bytes = HistoryStore::index_document(&inner.index).map_err(history_save_error)?;
+        inner.index_dirty = false;
+        (inner.history.clone(), bytes)
+    };
+
+    let (history, bytes) = prepared;
+    let result = tokio::task::spawn_blocking(move || {
+        write_document(&history.index_path(), &bytes).map_err(history_save_error)
+    })
+    .await
+    .map_err(|error| AppError::internal(format!("The history writer failed. ({error})")))?;
+
+    if result.is_err() {
+        store.lock().await.index_dirty = true;
+    }
+    result
 }
 
 fn history_save_error(error: String) -> AppError {
@@ -582,17 +742,43 @@ fn notify(listener: Option<ChangeListener>) {
 }
 
 pub fn derive_title(text: &str) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut normalized = String::new();
+    let mut truncated = false;
+    let mut characters = 0usize;
+
+    for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            characters += 1;
+            if characters > TITLE_LIMIT {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+        }
+
+        for character in word.chars() {
+            characters += 1;
+            if characters > TITLE_LIMIT {
+                truncated = true;
+                break;
+            }
+            normalized.push(character);
+        }
+        if truncated {
+            break;
+        }
+    }
+
     if normalized.is_empty() {
         return FALLBACK_TITLE.to_owned();
     }
-    if normalized.chars().count() <= TITLE_LIMIT {
+    if !truncated {
         return normalized;
     }
 
-    let mut truncated: String = normalized.chars().take(TITLE_LIMIT - 1).collect();
-    truncated.push('…');
-    truncated
+    let mut shortened: String = normalized.chars().take(TITLE_LIMIT - 1).collect();
+    shortened.push('…');
+    shortened
 }
 
 #[cfg(test)]
@@ -1038,5 +1224,283 @@ mod tests {
         let snapshot = reopened.get_snapshot(&session_id).await.expect("snapshot");
         assert_eq!(snapshot.messages[1].status, MessageStatus::Interrupted);
         assert_eq!(snapshot.messages[1].content, "partial before quit");
+    }
+    #[tokio::test]
+    async fn bounds_the_message_cache_and_reloads_evicted_sessions_from_disk() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+
+        let mut ids = Vec::new();
+        for index in 0..(MAX_CACHED_SESSIONS + 3) {
+            let session = harness.store.create().await.expect("create");
+            harness
+                .store
+                .append_user_message(&session.id, &format!("message {index}"))
+                .await
+                .expect("append");
+            harness.store.flush(&session.id).await.expect("flush");
+            ids.push(session.id);
+        }
+
+        let cached = harness.store.inner.lock().await.messages.len();
+        assert!(
+            cached <= MAX_CACHED_SESSIONS + 1,
+            "cache must stay bounded, saw {cached}"
+        );
+
+        for (index, id) in ids.iter().enumerate() {
+            let snapshot = harness.store.get_snapshot(id).await.expect("snapshot");
+            assert_eq!(snapshot.messages.len(), 1);
+            assert_eq!(snapshot.messages[0].content, format!("message {index}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_at_most_twenty_warnings() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        {
+            let mut inner = harness.store.inner.lock().await;
+            for index in 0..(MAX_WARNINGS + 7) {
+                push_warning(&mut inner, format!("warning {index}"));
+            }
+        }
+
+        let warnings = harness.store.get_warnings().await;
+        assert_eq!(warnings.len(), MAX_WARNINGS);
+        assert_eq!(warnings[0], format!("warning {}", 7));
+        assert_eq!(
+            warnings[MAX_WARNINGS - 1],
+            format!("warning {}", MAX_WARNINGS + 6)
+        );
+    }
+
+    #[tokio::test]
+    async fn one_debounce_task_per_session_writes_once_per_window() {
+        let harness = harness(40);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "hi")
+            .await
+            .expect("append");
+        harness.store.flush(&session_id).await.expect("flush");
+
+        {
+            let inner = harness.store.inner.lock().await;
+            assert_eq!(inner.timers.len(), 0);
+        }
+
+        let assistant = harness
+            .store
+            .begin_assistant_message(&session_id)
+            .await
+            .expect("assistant");
+        for _ in 0..25 {
+            harness
+                .store
+                .append_delta(&session_id, &assistant.id, "x")
+                .await;
+        }
+        {
+            let inner = harness.store.inner.lock().await;
+            assert_eq!(
+                inner.timers.len(),
+                1,
+                "rapid deltas share a single debounce task"
+            );
+        }
+
+        harness.store.flush(&session_id).await.expect("flush");
+        {
+            let inner = harness.store.inner.lock().await;
+            assert_eq!(inner.timers.len(), 0);
+        }
+
+        let stored = HistoryStore::new(harness.directory.join("history")).load_session(&session_id);
+        let stored_assistant = stored
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(stored_assistant.content, "x".repeat(25));
+    }
+
+    #[tokio::test]
+    async fn writes_compact_json_that_round_trips() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "compact please")
+            .await
+            .expect("append");
+        harness.store.flush(&session_id).await.expect("flush");
+
+        let path = HistoryStore::new(harness.directory.join("history")).session_path(&session_id);
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(
+            !raw.contains("\n  "),
+            "compact JSON must not be pretty printed"
+        );
+        assert_eq!(raw.lines().count(), 1, "the document is one compact line");
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(parsed["messages"][0]["content"], "compact please");
+
+        let loaded = HistoryStore::new(harness.directory.join("history")).load_session(&session_id);
+        assert_eq!(loaded.messages[0].content, "compact please");
+    }
+
+    #[tokio::test]
+    async fn compact_output_is_smaller_than_pretty_output() {
+        let message = StoredMessage {
+            id: "message-1".to_owned(),
+            role: MessageRole::Assistant,
+            content: "hello".to_owned(),
+            created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            status: MessageStatus::Complete,
+            error: None,
+            metadata: None,
+        };
+        let compact = HistoryStore::session_document("session-1", std::slice::from_ref(&message))
+            .expect("compact");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "sessionId": "session-1",
+            "messages": [message],
+        }))
+        .expect("pretty");
+
+        assert!(compact.len() < pretty.len());
+    }
+
+    #[tokio::test]
+    async fn a_dirty_session_survives_a_failed_write_and_is_retried() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+
+        // Replace the history directory with a regular file so writes fail.
+        let history_dir = harness.directory.join("history");
+        let aside = harness.directory.join("history-aside");
+        fs::rename(&history_dir, &aside).expect("move history");
+        fs::write(&history_dir, b"not a directory").expect("block the directory");
+
+        let result = harness
+            .store
+            .append_user_message(&session_id, "keep me")
+            .await;
+        assert!(result.is_err(), "the write must report the failure");
+
+        let dirty = harness.store.inner.lock().await.dirty.contains(&session_id);
+        assert!(dirty, "a failed write keeps the session dirty for a retry");
+
+        // Restore the directory and retry.
+        fs::remove_file(&history_dir).expect("remove blocker");
+        fs::rename(&aside, &history_dir).expect("restore history");
+
+        harness.store.flush(&session_id).await.expect("retry flush");
+        let persisted = HistoryStore::new(&history_dir).load_session(&session_id);
+        assert_eq!(persisted.messages[0].content, "keep me");
+    }
+
+    #[tokio::test]
+    async fn flush_all_continues_through_a_failing_session() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let first = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&first, "first")
+            .await
+            .expect("append");
+
+        let blocked_session = harness.store.create().await.expect("create");
+        {
+            let mut inner = harness.store.inner.lock().await;
+            inner
+                .messages
+                .insert(blocked_session.id.clone(), Vec::new());
+            inner.dirty.insert(blocked_session.id.clone());
+        }
+
+        // Block only one session path by making its target a directory.
+        let store = HistoryStore::new(harness.directory.join("history"));
+        let blocked_path = store.session_path(&blocked_session.id);
+        let _ = fs::remove_file(&blocked_path);
+        fs::create_dir_all(&blocked_path).expect("block");
+
+        let error = harness
+            .store
+            .flush_all()
+            .await
+            .expect_err("one write fails");
+        assert!(error.message.contains("could not be saved"));
+
+        let persisted = store.load_session(&first);
+        assert_eq!(
+            persisted.messages[0].content, "first",
+            "other sessions are still written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_large_prompt_derives_a_title_quickly_and_correctly() {
+        let large = "word ".repeat(40_000);
+        let title = derive_title(&large);
+
+        assert_eq!(title.chars().count(), TITLE_LIMIT);
+        assert!(title.ends_with('…'));
+        assert!(title.starts_with("word word"));
+    }
+
+    #[tokio::test]
+    async fn appends_messages_while_a_snapshot_is_being_serialized() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "start")
+            .await
+            .expect("append");
+
+        let assistant = harness
+            .store
+            .begin_assistant_message(&session_id)
+            .await
+            .expect("assistant");
+
+        // Concurrent appends and snapshots must not interleave a torn document.
+        let store = harness.store.clone();
+        let id = assistant.id.clone();
+        let session = session_id.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..50 {
+                store.append_delta(&session, &id, "x").await;
+            }
+        });
+        for _ in 0..20 {
+            let snapshot = harness
+                .store
+                .get_snapshot(&session_id)
+                .await
+                .expect("snapshot");
+            assert_eq!(snapshot.messages.len(), 2);
+        }
+        writer.await.expect("writer");
+
+        harness.store.flush(&session_id).await.expect("flush");
+        let persisted =
+            HistoryStore::new(harness.directory.join("history")).load_session(&session_id);
+        let persisted_assistant = persisted
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(persisted_assistant.content, "x".repeat(50));
     }
 }

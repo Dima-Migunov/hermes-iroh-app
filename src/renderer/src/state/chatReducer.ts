@@ -10,6 +10,10 @@ import type {
   StoredMessage,
 } from '@shared/protocol'
 
+export interface NoticeEntry extends AppNotice {
+  id: string
+}
+
 export interface ChatState {
   identityNodeId: string | null
   config: ClientConfig | null
@@ -17,12 +21,19 @@ export interface ChatState {
   sessions: SessionSummary[]
   activeSessionId: string | null
   transcripts: Record<string, StoredMessage[]>
+  transcriptOrder: string[]
   activeRequestId: string | null
+  activeRequestSessionId: string | null
   activeAssistantId: string | null
   generating: boolean
   error: { code: ErrorCode; message: string } | null
-  notices: AppNotice[]
+  notices: NoticeEntry[]
 }
+
+export const MAX_CACHED_TRANSCRIPTS = 4
+export const MAX_NOTICES = 20
+
+const EMPTY_MESSAGES: StoredMessage[] = []
 
 export const initialChatState: ChatState = {
   identityNodeId: null,
@@ -31,18 +42,27 @@ export const initialChatState: ChatState = {
   sessions: [],
   activeSessionId: null,
   transcripts: {},
+  transcriptOrder: [],
   activeRequestId: null,
+  activeRequestSessionId: null,
   activeAssistantId: null,
   generating: false,
   error: null,
   notices: [],
 }
 
+let noticeSequence = 0
+
+function nextNoticeId(): string {
+  noticeSequence += 1
+  return `notice-${noticeSequence}`
+}
+
 export type ChatAction =
   | {
       type: 'bootstrap'
-      identityNodeId: string
-      config: ClientConfig
+      identityNodeId: string | null
+      config: ClientConfig | null
       connection: ConnectionStatus
       sessions: SessionSummary[]
       snapshot: SessionSnapshot
@@ -61,15 +81,20 @@ export type ChatAction =
       createdAt: string
     }
   | { type: 'prompt/request'; requestId: string }
-  | { type: 'prompt/start'; requestId: string; createdAt: string }
+  | { type: 'prompt/start'; requestId: string; sessionId: string; createdAt: string }
   | {
       type: 'prompt/delta'
       requestId: string
       chunks: string[]
       createdAt: string
     }
-  | { type: 'prompt/done'; requestId: string; metadata?: ResponseMetadata }
-  | { type: 'prompt/cancelled'; requestId: string }
+  | {
+      type: 'prompt/done'
+      requestId: string
+      sessionId: string
+      metadata?: ResponseMetadata
+    }
+  | { type: 'prompt/cancelled'; requestId: string; sessionId: string }
   | {
       type: 'prompt/error'
       requestId: string
@@ -79,24 +104,29 @@ export type ChatAction =
     }
   | { type: 'error/dismiss' }
   | { type: 'notice/add'; notice: AppNotice }
-  | { type: 'notice/dismiss'; index: number }
+  | { type: 'notice/dismiss'; id: string }
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
-    case 'bootstrap':
+    case 'bootstrap': {
+      const sessionId = action.snapshot.session.id
+      const cached = rememberTranscript(
+        { ...state, activeSessionId: sessionId },
+        sessionId,
+        action.snapshot.messages,
+      )
       return {
         ...state,
         identityNodeId: action.identityNodeId,
         config: action.config,
         connection: action.connection,
         sessions: action.sessions,
-        activeSessionId: action.snapshot.session.id,
-        transcripts: {
-          ...state.transcripts,
-          [action.snapshot.session.id]: action.snapshot.messages,
-        },
-        notices: action.notices,
+        activeSessionId: sessionId,
+        transcripts: cached.transcripts,
+        transcriptOrder: cached.transcriptOrder,
+        notices: mergeNotices(state.notices, action.notices),
       }
+    }
 
     case 'connection/set':
       return { ...state, connection: action.status }
@@ -104,40 +134,45 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case 'config/saved':
       return { ...state, config: action.config }
 
-    case 'sessions/set': {
-      const activeSessionId =
-        state.activeSessionId &&
-        action.sessions.some((session) => session.id === state.activeSessionId)
-          ? state.activeSessionId
-          : (action.sessions[0]?.id ?? null)
-      return { ...state, sessions: action.sessions, activeSessionId }
-    }
+    case 'sessions/set':
+      return { ...state, sessions: action.sessions }
 
-    case 'session/created':
+    case 'session/created': {
+      if (state.generating) return state
+      const cached = rememberTranscript(
+        { ...state, activeSessionId: action.session.id },
+        action.session.id,
+        EMPTY_MESSAGES,
+      )
       return {
         ...state,
         sessions: [action.session, ...state.sessions.filter((item) => item.id !== action.session.id)],
         activeSessionId: action.session.id,
-        transcripts: { ...state.transcripts, [action.session.id]: [] },
+        transcripts: cached.transcripts,
+        transcriptOrder: cached.transcriptOrder,
         error: null,
       }
+    }
 
     case 'session/activated': {
       if (state.generating) return state
+      const sessionId = action.snapshot.session.id
+      const cached = rememberTranscript(
+        { ...state, activeSessionId: sessionId },
+        sessionId,
+        action.snapshot.messages,
+      )
       return {
         ...state,
-        activeSessionId: action.snapshot.session.id,
-        transcripts: {
-          ...state.transcripts,
-          [action.snapshot.session.id]: action.snapshot.messages,
-        },
+        activeSessionId: sessionId,
+        transcripts: cached.transcripts,
+        transcriptOrder: cached.transcriptOrder,
         error: null,
       }
     }
 
     case 'prompt/sent': {
       if (state.generating) return state
-      const messages = state.transcripts[action.sessionId] ?? []
       const userMessage: StoredMessage = {
         id: action.messageId,
         role: 'user',
@@ -145,16 +180,24 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         createdAt: action.createdAt,
         status: 'complete',
       }
-      return {
+      const generatingState: ChatState = {
         ...state,
-        transcripts: {
-          ...state.transcripts,
-          [action.sessionId]: [...messages, userMessage],
-        },
         activeRequestId: 'pending',
+        activeRequestSessionId: action.sessionId,
         activeAssistantId: null,
         generating: true,
         error: null,
+      }
+      const messages = state.transcripts[action.sessionId] ?? EMPTY_MESSAGES
+      const cached = rememberTranscript(
+        generatingState,
+        action.sessionId,
+        [...messages, userMessage],
+      )
+      return {
+        ...generatingState,
+        transcripts: cached.transcripts,
+        transcriptOrder: cached.transcriptOrder,
       }
     }
 
@@ -165,14 +208,13 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'prompt/start': {
       if (!state.generating) return state
+      if (action.sessionId !== state.activeRequestSessionId) return state
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
         return state
       }
-      if (state.activeAssistantId) return { ...state, activeRequestId: action.requestId }
+      if (state.activeAssistantId) return state
 
-      const sessionId = state.activeSessionId
-      if (!sessionId) return state
-      const messages = state.transcripts[sessionId] ?? []
+      const messages = state.transcripts[action.sessionId] ?? EMPTY_MESSAGES
       const assistantMessage: StoredMessage = {
         id: `assistant-${action.requestId}`,
         role: 'assistant',
@@ -186,7 +228,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         activeAssistantId: assistantMessage.id,
         transcripts: {
           ...state.transcripts,
-          [sessionId]: [...messages, assistantMessage],
+          [action.sessionId]: [...messages, assistantMessage],
         },
       }
     }
@@ -196,12 +238,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
         return state
       }
-      const sessionId = state.activeSessionId
+      const sessionId = state.activeRequestSessionId
       if (!sessionId) return state
       const content = action.chunks.join('')
       if (content.length === 0) return state
 
-      const messages = state.transcripts[sessionId] ?? []
+      const messages = state.transcripts[sessionId] ?? EMPTY_MESSAGES
       const assistantId = state.activeAssistantId ?? `assistant-${action.requestId}`
       const existingIndex = messages.findIndex((message) => message.id === assistantId)
 
@@ -236,6 +278,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'prompt/done': {
       if (!state.generating) return state
+      if (action.sessionId !== state.activeRequestSessionId) return state
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
         return state
       }
@@ -248,17 +291,24 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'prompt/cancelled': {
       if (!state.generating) return state
+      if (action.sessionId !== state.activeRequestSessionId) return state
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
         return state
       }
 
-      const sessionId = state.activeSessionId
+      const sessionId = state.activeRequestSessionId
       const assistantId = state.activeAssistantId
       if (!sessionId || !assistantId) {
-        return { ...state, generating: false, activeRequestId: null, activeAssistantId: null }
+        return {
+          ...state,
+          generating: false,
+          activeRequestId: null,
+          activeRequestSessionId: null,
+          activeAssistantId: null,
+        }
       }
 
-      const messages = state.transcripts[sessionId] ?? []
+      const messages = state.transcripts[sessionId] ?? EMPTY_MESSAGES
       const updated = messages.map((message) =>
         message.id === assistantId && message.status === 'streaming'
           ? { ...message, status: 'interrupted' as const }
@@ -270,12 +320,14 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         transcripts: { ...state.transcripts, [sessionId]: updated },
         generating: false,
         activeRequestId: null,
+        activeRequestSessionId: null,
         activeAssistantId: null,
       }
     }
 
     case 'prompt/error': {
       if (!state.generating) return state
+      if (action.sessionId !== state.activeRequestSessionId) return state
       if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
         return state
       }
@@ -285,10 +337,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         status: 'failed',
         error,
       }))
-      const sessionId = withFailedAssistant.activeSessionId
-      if (!sessionId) return { ...withFailedAssistant, error }
 
-      const messages = withFailedAssistant.transcripts[sessionId] ?? []
+      const messages = withFailedAssistant.transcripts[action.sessionId] ?? EMPTY_MESSAGES
       const lastUserIndex = [...messages]
         .map((message, index) => ({ message, index }))
         .reverse()
@@ -306,7 +356,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...withFailedAssistant,
         error,
-        transcripts: { ...withFailedAssistant.transcripts, [sessionId]: updated },
+        transcripts: { ...withFailedAssistant.transcripts, [action.sessionId]: updated },
       }
     }
 
@@ -314,14 +364,54 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return { ...state, error: null }
 
     case 'notice/add':
-      if (state.notices.some((notice) => notice.message === action.notice.message)) return state
-      return { ...state, notices: [...state.notices, action.notice] }
+      return { ...state, notices: appendNotice(state.notices, action.notice) }
 
     case 'notice/dismiss':
       return {
         ...state,
-        notices: state.notices.filter((_notice, index) => index !== action.index),
+        notices: state.notices.filter((notice) => notice.id !== action.id),
       }
+  }
+}
+
+function appendNotice(notices: NoticeEntry[], notice: AppNotice): NoticeEntry[] {
+  if (notices.some((entry) => entry.message === notice.message)) return notices
+  const next = [...notices, { ...notice, id: nextNoticeId() }]
+  return next.length > MAX_NOTICES ? next.slice(next.length - MAX_NOTICES) : next
+}
+
+function mergeNotices(current: NoticeEntry[], arriving: AppNotice[]): NoticeEntry[] {
+  let notices = current
+  for (const notice of arriving) notices = appendNotice(notices, notice)
+  return notices
+}
+
+interface CachedTranscripts {
+  transcripts: Record<string, StoredMessage[]>
+  transcriptOrder: string[]
+}
+
+function rememberTranscript(
+  state: ChatState,
+  sessionId: string,
+  messages: StoredMessage[],
+): CachedTranscripts {
+  const order = [sessionId, ...state.transcriptOrder.filter((id) => id !== sessionId)]
+  const retained = new Set(order.slice(0, MAX_CACHED_TRANSCRIPTS))
+  if (state.activeSessionId) retained.add(state.activeSessionId)
+  if (state.activeRequestSessionId) retained.add(state.activeRequestSessionId)
+
+  const nextTranscripts: Record<string, StoredMessage[]> = {
+    ...state.transcripts,
+    [sessionId]: messages,
+  }
+  for (const id of Object.keys(nextTranscripts)) {
+    if (!retained.has(id)) delete nextTranscripts[id]
+  }
+
+  return {
+    transcripts: nextTranscripts,
+    transcriptOrder: order.filter((id) => retained.has(id)),
   }
 }
 
@@ -329,39 +419,37 @@ function finishGeneration(
   state: ChatState,
   updateAssistant: (message: StoredMessage) => StoredMessage,
 ): ChatState {
-  const sessionId = state.activeSessionId
-  if (!sessionId) return { ...state, generating: false, activeRequestId: null }
+  const sessionId = state.activeRequestSessionId
+  const assistantId = state.activeAssistantId
 
-  const messages = state.transcripts[sessionId] ?? []
-  let updated = messages.map((message) =>
-    message.id === state.activeAssistantId ? updateAssistant(message) : message,
-  )
-
-  if (state.activeAssistantId === null) {
-    const lastUserIndex = [...updated]
-      .map((message, index) => ({ message, index }))
-      .reverse()
-      .find((entry) => entry.message.role === 'user')?.index
-
-    if (lastUserIndex !== undefined) {
-      updated = updated.map((message, index) =>
-        index === lastUserIndex ? updateAssistant(message) : message,
-      )
+  if (!sessionId || !assistantId) {
+    return {
+      ...state,
+      generating: false,
+      activeRequestId: null,
+      activeRequestSessionId: null,
+      activeAssistantId: null,
     }
   }
+
+  const messages = state.transcripts[sessionId] ?? EMPTY_MESSAGES
+  const updated = messages.map((message) =>
+    message.id === assistantId ? updateAssistant(message) : message,
+  )
 
   return {
     ...state,
     transcripts: { ...state.transcripts, [sessionId]: updated },
     generating: false,
     activeRequestId: null,
+    activeRequestSessionId: null,
     activeAssistantId: null,
   }
 }
 
 export function selectActiveMessages(state: ChatState): StoredMessage[] {
-  if (!state.activeSessionId) return []
-  return state.transcripts[state.activeSessionId] ?? []
+  if (!state.activeSessionId) return EMPTY_MESSAGES
+  return state.transcripts[state.activeSessionId] ?? EMPTY_MESSAGES
 }
 
 export function selectLatestResponseMetadata(state: ChatState): ResponseMetadata | undefined {
@@ -382,7 +470,12 @@ export function applyPromptEventToState(
 ): ChatState {
   switch (event.type) {
     case 'start':
-      return chatReducer(state, { type: 'prompt/start', requestId: event.requestId, createdAt })
+      return chatReducer(state, {
+        type: 'prompt/start',
+        requestId: event.requestId,
+        sessionId: event.sessionId,
+        createdAt,
+      })
     case 'delta':
       return chatReducer(state, {
         type: 'prompt/delta',
@@ -394,10 +487,15 @@ export function applyPromptEventToState(
       return chatReducer(state, {
         type: 'prompt/done',
         requestId: event.requestId,
+        sessionId: event.sessionId,
         metadata: event.metadata,
       })
     case 'cancelled':
-      return chatReducer(state, { type: 'prompt/cancelled', requestId: event.requestId })
+      return chatReducer(state, {
+        type: 'prompt/cancelled',
+        requestId: event.requestId,
+        sessionId: event.sessionId,
+      })
     case 'error':
       return chatReducer(state, {
         type: 'prompt/error',

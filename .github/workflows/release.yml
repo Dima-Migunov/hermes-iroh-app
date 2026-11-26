@@ -14,41 +14,7 @@ concurrency:
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 26.13.1
-          cache: npm
-      - run: npm ci
-      - name: Verify tag and application version
-        run: npm run tauri:check
-      - run: npm run typecheck
-      - run: npm test
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            wget
-      - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-      - name: Rust lint
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-      - name: Rust formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+    uses: ./.github/workflows/verify.yml
 
   build:
     needs: verify
@@ -79,32 +45,28 @@ jobs:
             bundles: deb
     steps:
       - uses: actions/checkout@v7
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "node=$(node scripts/toolchain.mjs node)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
         with:
-          node-version: 26.13.1
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
           key: ${{ matrix.os }}-${{ matrix.arch }}
-      - name: Install Linux build dependencies
-        if: matrix.platform == 'linux'
+      - if: matrix.platform == 'linux'
+        uses: ./.github/actions/install-linux-deps
+      - name: Resolve the bundle directory
+        id: bundle
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            file \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            libwebkit2gtk-4.1-dev \
-            libxdo-dev \
-            patchelf \
-            wget
+          set -euo pipefail
+          echo "dir=${CARGO_TARGET_DIR:-$PWD/src-tauri/target}/release/bundle" >> "$GITHUB_OUTPUT"
       - run: npm ci
-      - run: npm run tauri:sync
       - run: npm run tauri:check
       - run: npm run build
       - name: Build Tauri bundles
@@ -121,17 +83,20 @@ jobs:
             image_arch=x86_64
           fi
           bash scripts/build-appimage.sh \
-            src-tauri/target/release/hermes-iroh-app \
+            "${CARGO_TARGET_DIR:-$PWD/src-tauri/target}/release/hermes-iroh-app" \
             "$version" \
             "$image_arch" \
-            src-tauri/target/release/bundle/appimage
+            "${{ steps.bundle.outputs.dir }}/appimage"
+        env:
+          APPIMAGETOOL_SHA256_X86_64: ${{ vars.APPIMAGETOOL_SHA256_X86_64 }}
+          APPIMAGETOOL_SHA256_AARCH64: ${{ vars.APPIMAGETOOL_SHA256_AARCH64 }}
       - name: Collect release assets
         shell: bash
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
           node scripts/collect-release-assets.mjs \
-            --input src-tauri/target/release/bundle \
+            --input "${{ steps.bundle.outputs.dir }}" \
             --output release \
             --version "$version"
       - name: Enforce the installer size budget
@@ -154,11 +119,18 @@ jobs:
       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "node=$(node scripts/toolchain.mjs node)" >> "$GITHUB_OUTPUT"
+          echo "ndk=$(node scripts/toolchain.mjs ndk)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
         with:
-          node-version: 26.13.1
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: npm
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@v7
         with:
           distribution: temurin
           java-version: "21"
@@ -167,13 +139,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-37.0" \
-            "platforms;android-37.2" \
-            "build-tools;37.0.0" \
-            "ndk;30.0.16248370"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          eval "sdkmanager --install $(node scripts/toolchain.mjs sdkmanager)"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$(node scripts/toolchain.mjs ndk)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -182,7 +149,6 @@ jobs:
           workspaces: "src-tauri -> target"
           key: android-arm64
       - run: npm ci
-      - run: npm run tauri:sync
       - run: npm run tauri:check
       - name: Require the Android signing material
         shell: bash
@@ -221,7 +187,8 @@ jobs:
           set -euo pipefail
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)
           test -n "$apk"
-          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$apk"
+          build_tools=$(node -p "require('./.toolchain.json').androidBuildTools[0]")
+          "$ANDROID_HOME/build-tools/$build_tools/apksigner" verify --print-certs "$apk"
       - name: Collect release assets
         shell: bash
         run: |
@@ -254,32 +221,24 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "node=$(node scripts/toolchain.mjs node)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
         with:
-          node-version: 26.13.1
+          node-version: ${{ steps.toolchain.outputs.node }}
       - name: Download installers
         uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
-      - name: Verify asset set
+      - name: Verify the exact asset set
         shell: bash
         run: |
           set -euo pipefail
-          check() {
-            local pattern="$1" expected="$2" actual
-            actual=$(find release -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')
-            if [ "$actual" -ne "$expected" ]; then
-              echo "::error::Expected $expected $pattern files, found $actual"
-              exit 1
-            fi
-          }
-          check '*.exe' 2
-          check '*.dmg' 1
-          check '*.zip' 1
-          check '*.AppImage' 2
-          check '*.deb' 2
-          check '*.apk' 1
+          version=$(node -p "require('./package.json').version")
+          node scripts/verify-release-assets.mjs --directory release --version "$version"
       - name: Enforce the installer size budget
         run: node scripts/check-installer-size.mjs --directory release
       - name: Generate checksums
@@ -311,6 +270,8 @@ jobs:
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
+          version=$(node -p "require('./package.json').version")
+          node scripts/verify-release-assets.mjs --directory release --version "$version"
           if gh release view "$tag" >/dev/null 2>&1; then
             if [ "$(gh release view "$tag" --json isDraft -q .isDraft)" = "true" ]; then
               echo "Reusing existing draft release $tag"

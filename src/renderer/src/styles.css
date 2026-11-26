@@ -791,7 +791,8 @@ textarea:disabled {
 
 .composer-send-button:focus,
 .composer-send-button:focus-visible {
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .composer-stop-icon {
@@ -882,5 +883,10 @@ textarea:disabled {
   .sidebar-sessions,
   .sidebar-toggle svg {
     transition: none;
+  }
+
+  .streaming-caret {
+    animation: none;
+    visibility: visible;
   }
 }

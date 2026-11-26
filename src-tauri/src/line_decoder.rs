@@ -4,6 +4,8 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 pub struct LineDecoder {
     pending: Vec<u8>,
+    /// Offset already scanned for a newline, so a long line is not rescanned per chunk.
+    scanned: usize,
     max_line_bytes: usize,
 }
 
@@ -15,6 +17,7 @@ impl LineDecoder {
     pub fn with_max_line_bytes(max_line_bytes: usize) -> Self {
         Self {
             pending: Vec::new(),
+            scanned: 0,
             max_line_bytes,
         }
     }
@@ -25,7 +28,7 @@ impl LineDecoder {
         let mut lines = Vec::new();
         let mut start = 0usize;
 
-        for index in 0..self.pending.len() {
+        for index in self.scanned..self.pending.len() {
             if self.pending[index] != b'\n' {
                 continue;
             }
@@ -38,7 +41,12 @@ impl LineDecoder {
             start = index + 1;
         }
 
-        self.pending.drain(..start);
+        if start > 0 {
+            self.pending.drain(..start);
+            self.scanned = 0;
+        } else {
+            self.scanned = self.pending.len();
+        }
 
         if self.pending.len() > self.max_line_bytes {
             return Err(self.line_too_long());
@@ -58,6 +66,7 @@ impl LineDecoder {
 
         let line = self.decode(&self.pending)?;
         self.pending.clear();
+        self.scanned = 0;
         Ok(vec![line])
     }
 
@@ -163,5 +172,35 @@ mod tests {
             .push(&[0xff, 0xfe, 0x0a])
             .expect_err("invalid utf-8");
         assert!(error.message.to_lowercase().contains("invalid utf-8"));
+    }
+    #[test]
+    fn resumes_scanning_from_the_last_offset_without_rescanning() {
+        let mut decoder = LineDecoder::new();
+        let partial = vec![b'a'; 4096];
+
+        assert!(decoder.push(&partial).expect("partial").is_empty());
+        assert!(decoder.push(&partial).expect("partial").is_empty());
+        assert!(decoder.push(&partial).expect("partial").is_empty());
+
+        let mut tail = vec![b'b'; 10];
+        tail.push(b'\n');
+        let lines = decoder.push(&tail).expect("complete");
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 4096 * 3 + 10);
+        assert!(lines[0].starts_with("aaa") && lines[0].ends_with("bbbbbbbbbb"));
+    }
+
+    #[test]
+    fn returns_frames_split_across_many_small_chunks_in_order() {
+        let mut decoder = LineDecoder::new();
+        let payload = b"{\"type\":\"start\"}\n{\"type\":\"done\"}\n";
+        let mut lines = Vec::new();
+
+        for byte in payload {
+            lines.extend(decoder.push(&[*byte]).expect("chunk"));
+        }
+
+        assert_eq!(lines, vec![r#"{"type":"start"}"#, r#"{"type":"done"}"#]);
     }
 }

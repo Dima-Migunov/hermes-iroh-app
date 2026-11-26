@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { SessionSummary } from '@shared/protocol'
 
 interface SessionListProps {
@@ -8,7 +9,18 @@ interface SessionListProps {
   onSelect: (id: string) => void
 }
 
-export function SessionList({
+const DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+})
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return DATE_FORMAT.format(date)
+}
+
+export const SessionList = memo(function SessionList({
   sessions,
   activeSessionId,
   disabled,
@@ -62,10 +74,4 @@ export function SessionList({
       </ul>
     </nav>
   )
-}
-
-function formatTimestamp(value: string): string {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-}
+})

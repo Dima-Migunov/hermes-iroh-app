@@ -17,7 +17,11 @@ export function CopyButton({ text, label = 'Copy', onCopy }: CopyButtonProps) {
   }, [])
 
   const handleClick = async (): Promise<void> => {
-    await onCopy(text)
+    try {
+      await onCopy(text)
+    } catch {
+      return
+    }
     setCopied(true)
     if (timerRef.current !== null) window.clearTimeout(timerRef.current)
     timerRef.current = window.setTimeout(() => setCopied(false), 2000)

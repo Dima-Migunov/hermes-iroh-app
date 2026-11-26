@@ -62,7 +62,7 @@ describe('desktop configuration contract', () => {
     expect(config.build.frontendDist).toBe('../out/renderer')
     expect(config.build.devUrl).toBe('http://localhost:1420')
     expect(config.build.beforeDevCommand).toBe('npm run dev')
-    expect(config.build.beforeBuildCommand).toContain('npm run tauri:sync')
+    expect(config.build.beforeBuildCommand).toBe('npm run build')
   })
 })
 

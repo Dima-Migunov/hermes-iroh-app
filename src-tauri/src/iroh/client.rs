@@ -14,10 +14,11 @@ use crate::protocol::{
     parse_server_frame, serialize_prompt, ClientConfig, ConnectionStatus, PromptEvent,
     PromptStateMachine,
 };
-use crate::targets::{parse_node_address, parse_ticket_address};
+use crate::targets::resolve_address;
 
 pub const ALPN_PROTOCOL: &[u8] = b"iroh-channel/1";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 pub type StatusCallback = Arc<dyn Fn(ConnectionStatus) + Send + Sync>;
@@ -32,6 +33,11 @@ pub struct PromptStreamRequest {
     pub cancel: CancellationToken,
 }
 
+enum OpenError {
+    Cancelled,
+    Failed(AppError),
+}
+
 struct Shared {
     status: std::sync::Mutex<ConnectionStatus>,
     on_status: Option<StatusCallback>,
@@ -42,7 +48,7 @@ impl Shared {
     fn get_status(&self) -> ConnectionStatus {
         self.status
             .lock()
-            .expect("the connection status lock is not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
@@ -51,7 +57,7 @@ impl Shared {
             let mut current = self
                 .status
                 .lock()
-                .expect("the connection status lock is not poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if *current == status {
                 false
             } else {
@@ -72,9 +78,11 @@ pub struct IrohClient {
     secret_key: SecretKey,
     get_config: ConfigProvider,
     connect_timeout: Duration,
+    idle_timeout: Duration,
     endpoint: Mutex<Option<Endpoint>>,
     shared: Arc<Shared>,
     shutting_down: AtomicBool,
+    connecting: Mutex<Option<CancellationToken>>,
 }
 
 impl IrohClient {
@@ -88,6 +96,7 @@ impl IrohClient {
             secret_key,
             get_config,
             connect_timeout: connect_timeout.unwrap_or(CONNECT_TIMEOUT),
+            idle_timeout: PROMPT_IDLE_TIMEOUT,
             endpoint: Mutex::new(None),
             shared: Arc::new(Shared {
                 status: std::sync::Mutex::new(ConnectionStatus::disconnected()),
@@ -95,6 +104,7 @@ impl IrohClient {
                 connection: Mutex::new(None),
             }),
             shutting_down: AtomicBool::new(false),
+            connecting: Mutex::new(None),
         }
     }
 
@@ -102,27 +112,51 @@ impl IrohClient {
         self.shared.get_status()
     }
 
-    pub async fn connect(&self) -> ConnectionStatus {
+    pub fn connect(&self) -> impl std::future::Future<Output = ConnectionStatus> + '_ {
+        self.connect_with(None)
+    }
+
+    pub async fn restart(&self) -> ConnectionStatus {
         self.shutting_down.store(false, Ordering::SeqCst);
-        if let Err(_error) = self.ensure_connection().await {
-            // The status already carries the mapped failure.
+        self.connect().await
+    }
+
+    async fn connect_with(&self, cancel: Option<CancellationToken>) -> ConnectionStatus {
+        if cancel.is_none() {
+            self.shutting_down.store(false, Ordering::SeqCst);
         }
+        let _ = self.ensure_connection_with(cancel).await;
         self.get_status()
     }
 
     pub async fn ensure_connection(&self) -> Result<Connection, AppError> {
+        self.ensure_connection_with(None).await
+    }
+
+    pub async fn ensure_connection_with(
+        &self,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Connection, AppError> {
         let mut slot = self.shared.connection.lock().await;
         if let Some(connection) = slot.as_ref() {
-            return Ok(connection.clone());
+            if !connection.close_reason().is_some() {
+                return Ok(connection.clone());
+            }
+            *slot = None;
         }
 
-        let connection = self.establish_connection().await?;
+        let connection = self.establish_connection(cancel.clone()).await?;
         *slot = Some(connection.clone());
+        drop(slot);
         self.watch_connection(connection.clone());
         Ok(connection)
     }
 
     pub async fn disconnect(&self) {
+        if let Some(cancel) = self.connecting.lock().await.take() {
+            cancel.cancel();
+        }
+
         let connection = {
             let mut slot = self.shared.connection.lock().await;
             slot.take()
@@ -131,12 +165,24 @@ impl IrohClient {
             connection.close(0u32.into(), b"");
         }
 
-        let endpoint = {
+        let config = (self.get_config)();
+        let relay_mode = crate::iroh::bindings::relay_mode_for(config.relay_url.as_deref()).ok();
+        let keep_endpoint = {
             let mut slot = self.endpoint.lock().await;
-            slot.take()
+            match (slot.as_ref(), relay_mode) {
+                (Some(_), Some(_)) => true,
+                (Some(_), None) => {
+                    slot.take();
+                    false
+                }
+                (None, _) => false,
+            }
         };
-        if let Some(endpoint) = endpoint {
-            endpoint.close().await;
+        if !keep_endpoint {
+            let endpoint = self.endpoint.lock().await.take();
+            if let Some(endpoint) = endpoint {
+                endpoint.close().await;
+            }
         }
 
         self.shared.set_status(ConnectionStatus::disconnected());
@@ -145,6 +191,10 @@ impl IrohClient {
     pub async fn close(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.disconnect().await;
+        let endpoint = self.endpoint.lock().await.take();
+        if let Some(endpoint) = endpoint {
+            endpoint.close().await;
+        }
     }
 
     pub async fn stream_prompt(&self, request: PromptStreamRequest) {
@@ -160,41 +210,36 @@ impl IrohClient {
             return;
         }
 
-        let connection = match self.ensure_connection().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                if !cancel.is_cancelled() {
-                    machine.handle_transport_error(&error);
-                }
-                return;
-            }
-        };
-
-        if cancel.is_cancelled() {
-            return;
-        }
-
-        let opened = tokio::select! {
-            _ = cancel.cancelled() => return,
-            result = connection.open_bi() => result,
-        };
-        let (mut send, mut recv) = match opened {
+        let connection = match self.open_with_reconnect(&cancel).await {
             Ok(stream) => stream,
-            Err(error) => {
+            Err(OpenError::Cancelled) => return,
+            Err(OpenError::Failed(error)) => {
                 if !cancel.is_cancelled() {
                     machine.handle_transport_error(&error);
                 }
                 return;
             }
         };
+        let (mut send, mut recv) = connection;
 
         let line = serialize_prompt(&request.session_id, &request.text);
-        if let Err(error) = send.write_all(line.as_bytes()).await {
-            if !cancel.is_cancelled() {
-                machine.handle_transport_error(&error);
+        let written = tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = send.write_all(line.as_bytes()) => Some(result),
+        };
+        match written {
+            None => {
+                let _ = recv.stop(0u32.into());
+                return;
             }
-            let _ = recv.stop(0u32.into());
-            return;
+            Some(Err(error)) => {
+                if !cancel.is_cancelled() {
+                    machine.handle_transport_error(&error);
+                }
+                let _ = recv.stop(0u32.into());
+                return;
+            }
+            Some(Ok(())) => {}
         }
         let _ = send.finish();
 
@@ -211,7 +256,23 @@ impl IrohClient {
                     let _ = recv.stop(0u32.into());
                     return;
                 }
-                result = recv.read(&mut buffer) => result,
+                result = tokio::time::timeout(self.idle_timeout, recv.read(&mut buffer)) => result,
+            };
+
+            let read = match read {
+                Err(_elapsed) => {
+                    if !cancel.is_cancelled() {
+                        machine.handle_transport_error(&AppError::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "The server stopped responding for {} seconds. Reconnect and try again.",
+                                self.idle_timeout.as_secs()
+                            ),
+                        ));
+                    }
+                    break;
+                }
+                Ok(result) => result,
             };
 
             match read {
@@ -252,7 +313,44 @@ impl IrohClient {
         let _ = recv.stop(0u32.into());
     }
 
-    async fn establish_connection(&self) -> Result<Connection, AppError> {
+    async fn open_with_reconnect(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream), OpenError> {
+        let connection = self.ensure_connection_with(Some(cancel.clone())).await;
+        let connection = match connection {
+            Ok(connection) => connection,
+            Err(error) => return Err(OpenError::Failed(error)),
+        };
+
+        let opened = tokio::select! {
+            _ = cancel.cancelled() => Err(OpenError::Cancelled),
+            result = connection.open_bi() => Ok(result),
+        }?;
+        let opened = match opened {
+            Ok(stream) => Ok(stream),
+            Err(_) => {
+                self.shared.connection.lock().await.take();
+                let reconnected = self.ensure_connection_with(Some(cancel.clone())).await;
+                match reconnected {
+                    Ok(connection) => tokio::select! {
+                        _ = cancel.cancelled() => Err(OpenError::Cancelled),
+                        result = connection.open_bi() => match result {
+                            Ok(stream) => Ok(stream),
+                            Err(error) => Err(OpenError::Failed(map_iroh_error_with(&error, true))),
+                        },
+                    },
+                    Err(error) => Err(OpenError::Failed(error)),
+                }
+            }
+        };
+        opened
+    }
+
+    async fn establish_connection(
+        &self,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Connection, AppError> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AppError::new(
                 ErrorCode::ConnectionClosed,
@@ -262,12 +360,53 @@ impl IrohClient {
 
         self.shared.set_status(ConnectionStatus::connecting());
 
+        let attempt_token = CancellationToken::new();
+        if let Some(cancel) = &cancel {
+            if cancel.is_cancelled() {
+                self.shared.set_status(ConnectionStatus::disconnected());
+                return Err(AppError::new(
+                    ErrorCode::ConnectionClosed,
+                    "The connection attempt was cancelled.",
+                ));
+            }
+        }
+        *self.connecting.lock().await = Some(attempt_token.clone());
+
+        let interrupted = async {
+            attempt_token.cancelled().await;
+            AppError::new(
+                ErrorCode::ConnectionClosed,
+                "The connection attempt was cancelled.",
+            )
+        };
+
         let result = async {
             let endpoint = self.get_endpoint().await?;
             let address = self.resolve_target()?;
-            self.connect_with_timeout(&endpoint, address).await
+            let attempt = self.connect_with_timeout(&endpoint, address);
+            match &cancel {
+                Some(cancel) => tokio::select! {
+                    interrupted = interrupted => Err(interrupted),
+                    _ = cancel.cancelled() => Err(AppError::new(
+                        ErrorCode::ConnectionClosed,
+                        "The connection attempt was cancelled.",
+                    )),
+                    result = attempt => result,
+                },
+                None => tokio::select! {
+                    interrupted = interrupted => Err(interrupted),
+                    result = attempt => result,
+                },
+            }
         }
         .await;
+
+        {
+            let mut slot = self.connecting.lock().await;
+            if slot.as_ref().is_some_and(|token| token == &attempt_token) {
+                *slot = None;
+            }
+        }
 
         match result {
             Ok(connection) => {
@@ -275,8 +414,12 @@ impl IrohClient {
                 Ok(connection)
             }
             Err(error) => {
-                self.shared
-                    .set_status(ConnectionStatus::error(error.message.clone()));
+                if error.code == ErrorCode::ConnectionClosed {
+                    self.shared.set_status(ConnectionStatus::disconnected());
+                } else {
+                    self.shared
+                        .set_status(ConnectionStatus::error(error.message.clone()));
+                }
                 Err(error)
             }
         }
@@ -302,18 +445,7 @@ impl IrohClient {
     }
 
     fn resolve_target(&self) -> Result<iroh::EndpointAddr, AppError> {
-        let config = (self.get_config)();
-
-        if let Some(ticket) = config.server_ticket.as_deref() {
-            return parse_ticket_address(ticket);
-        }
-        if let Some(node_id) = config.server_node_id.as_deref() {
-            return parse_node_address(node_id, config.relay_url.as_deref());
-        }
-
-        Err(AppError::configuration(
-            "No server target is configured. Save an endpoint ticket or a server NodeId in settings.",
-        ))
+        resolve_address(&(self.get_config)())
     }
 
     async fn connect_with_timeout(
@@ -461,6 +593,22 @@ mod tests {
             on_status,
             Some(Duration::from_secs(15)),
         )
+    }
+
+    fn create_client_with_idle(ticket: String, idle: Duration) -> IrohClient {
+        let config = ClientConfig {
+            server_ticket: Some(ticket),
+            server_node_id: None,
+            relay_url: None,
+        };
+        let mut client = IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            Some(Duration::from_secs(15)),
+        );
+        client.idle_timeout = idle;
+        client
     }
 
     fn event_types(events: &[PromptEvent]) -> Vec<&'static str> {
@@ -798,6 +946,261 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(client.get_status().state, ConnectionState::Disconnected);
+
+        client.close().await;
+        endpoint.close().await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fails_with_a_timeout_when_the_server_goes_silent_after_start() {
+        let (server, ticket) = start_mock_server(|_connection, mut send, mut recv| async move {
+            let _ = read_prompt_line(&mut recv).await;
+            write_line(
+                &mut send,
+                serde_json::json!({ "type": "start", "session_id": "session-1" }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+
+        let client = create_client_with_idle(ticket, Duration::from_millis(150));
+        let events = collect_prompt(
+            &client,
+            "request-1",
+            "session-1",
+            "hello",
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(event_types(&events), vec!["start", "error"]);
+        assert!(matches!(
+            &events[1],
+            PromptEvent::Error {
+                code: ErrorCode::Timeout,
+                ..
+            }
+        ));
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_connect_stops_the_prompt_without_an_error() {
+        // Nothing listens for this ticket, so the connect attempt cannot complete.
+        let unreachable =
+            EndpointTicket::new(iroh::EndpointAddr::new(SecretKey::generate().public()))
+                .to_string();
+        let config = ClientConfig {
+            server_ticket: Some(unreachable),
+            server_node_id: None,
+            relay_url: None,
+        };
+        let client = IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            Some(Duration::from_secs(30)),
+        );
+
+        let cancel = CancellationToken::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancel.cancel();
+            })
+        };
+
+        let events = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect_prompt(&client, "request-1", "session-1", "hello", cancel),
+        )
+        .await
+        .expect("cancellation must interrupt the connect attempt");
+        canceller.await.expect("canceller");
+
+        assert!(
+            events.is_empty(),
+            "cancellation during connect emits no error: {events:?}"
+        );
+
+        client.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_interrupts_a_pending_connect_instead_of_waiting_for_its_timeout() {
+        let config = ClientConfig {
+            server_ticket: Some(
+                EndpointTicket::new(iroh::EndpointAddr::new(SecretKey::generate().public()))
+                    .to_string(),
+            ),
+            server_node_id: None,
+            relay_url: None,
+        };
+        let client = Arc::new(IrohClient::new(
+            SecretKey::generate(),
+            Arc::new(move || config.clone()),
+            None,
+            Some(Duration::from_secs(30)),
+        ));
+
+        let connecting = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.connect().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(10), client.disconnect())
+            .await
+            .expect("disconnect must not wait for the connect timeout");
+
+        let status = tokio::time::timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("the connect attempt must end")
+            .expect("join");
+        assert_ne!(status.state, ConnectionState::Connected);
+
+        client.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnects_when_the_cached_connection_has_closed() {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![ALPN_PROTOCOL.to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .expect("bind address")
+            .bind()
+            .await
+            .expect("bind endpoint");
+        let ticket = EndpointTicket::new(endpoint.addr()).to_string();
+
+        let accepting = endpoint.clone();
+        tokio::spawn(async move {
+            // Serve two connections: the first closes after one prompt, the second serves another.
+            for round in 0..2 {
+                let Some(incoming) = accepting.accept().await else {
+                    return;
+                };
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+                let _ = read_prompt_line(&mut recv).await;
+                write_line(
+                    &mut send,
+                    serde_json::json!({ "type": "start", "session_id": "session-1" }),
+                )
+                .await;
+                write_line(&mut send, serde_json::json!({ "type": "done" })).await;
+                let _ = send.finish();
+                if round == 0 {
+                    // Give the client time to consume the frames before dropping the stream.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    connection.close(0u32.into(), b"bye");
+                } else {
+                    let _ = connection.closed().await;
+                }
+            }
+        });
+
+        let client = create_client(ticket, None);
+        let first = collect_prompt(
+            &client,
+            "request-1",
+            "session-1",
+            "hello",
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            event_types(&first) == vec!["start", "done"],
+            "first prompt failed: {first:?}"
+        );
+
+        for _ in 0..100 {
+            if client.get_status().state == ConnectionState::Disconnected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let second = collect_prompt(
+            &client,
+            "request-2",
+            "session-1",
+            "again",
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            event_types(&second) == vec!["start", "done"],
+            "the second prompt must reconnect instead of reusing a closed connection: {second:?}"
+        );
+
+        client.close().await;
+        endpoint.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_reconnects_after_a_permanent_close() {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .alpns(vec![ALPN_PROTOCOL.to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .expect("bind address")
+            .bind()
+            .await
+            .expect("bind endpoint");
+        let ticket = EndpointTicket::new(endpoint.addr()).to_string();
+
+        let accepting = endpoint.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Some(incoming) = accepting.accept().await else {
+                    return;
+                };
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+                let _ = read_prompt_line(&mut recv).await;
+                write_line(
+                    &mut send,
+                    serde_json::json!({ "type": "start", "session_id": "session-1" }),
+                )
+                .await;
+                write_line(&mut send, serde_json::json!({ "type": "done" })).await;
+                let _ = send.finish();
+                let _ = connection.closed().await;
+            }
+        });
+
+        let client = create_client(ticket, None);
+        let first = collect_prompt(
+            &client,
+            "request-1",
+            "session-1",
+            "hello",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(event_types(&first), vec!["start", "done"]);
+
+        client.close().await;
+        assert_ne!(client.get_status().state, ConnectionState::Connected);
+
+        let status = client.restart().await;
+        assert_eq!(
+            status.state,
+            ConnectionState::Connected,
+            "restart must clear the permanent shutdown flag"
+        );
 
         client.close().await;
         endpoint.close().await;

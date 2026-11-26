@@ -88,7 +88,7 @@ impl HistoryStore {
         }
     }
 
-    pub fn save_index(&self, index: &HistoryIndex) -> Result<(), String> {
+    pub fn index_document(index: &HistoryIndex) -> Result<Vec<u8>, String> {
         #[derive(Serialize)]
         struct IndexDocument<'a> {
             version: u8,
@@ -97,12 +97,16 @@ impl HistoryStore {
             sessions: &'a [SessionSummary],
         }
 
-        let document = IndexDocument {
+        serialize_document(&IndexDocument {
             version: 1,
             active_session_id: index.active_session_id.as_ref(),
             sessions: &index.sessions,
-        };
-        save_document(&self.index_path(), &document)
+        })
+    }
+
+    pub fn save_index(&self, index: &HistoryIndex) -> Result<(), String> {
+        let bytes = Self::index_document(index)?;
+        write_document(&self.index_path(), &bytes)
     }
 
     pub fn load_session(&self, session_id: &str) -> SessionLoadResult {
@@ -142,7 +146,10 @@ impl HistoryStore {
         }
     }
 
-    pub fn save_session(&self, session_id: &str, messages: &[StoredMessage]) -> Result<(), String> {
+    pub fn session_document(
+        session_id: &str,
+        messages: &[StoredMessage],
+    ) -> Result<Vec<u8>, String> {
         #[derive(Serialize)]
         struct SessionDocument<'a> {
             version: u8,
@@ -151,21 +158,28 @@ impl HistoryStore {
             messages: &'a [StoredMessage],
         }
 
-        let document = SessionDocument {
+        serialize_document(&SessionDocument {
             version: 1,
             session_id,
             messages,
-        };
-        save_document(&self.session_path(session_id), &document)
+        })
     }
 
-    pub fn flush(&self) {}
+    pub fn save_session(&self, session_id: &str, messages: &[StoredMessage]) -> Result<(), String> {
+        let bytes = Self::session_document(session_id, messages)?;
+        write_document(&self.session_path(session_id), &bytes)
+    }
 }
 
-fn save_document<T: Serialize>(path: &Path, document: &T) -> Result<(), String> {
-    let serialized = serde_json::to_string_pretty(document).map_err(|error| error.to_string())?;
-    write_file_atomic(path, format!("{serialized}\n").as_bytes(), None)
-        .map_err(|error| error.to_string())
+/// Serializes a document to compact JSON bytes so the caller can write it off the runtime.
+pub fn serialize_document<T: Serialize>(document: &T) -> Result<Vec<u8>, String> {
+    let serialized = serde_json::to_string(document).map_err(|error| error.to_string())?;
+    Ok(format!("{serialized}\n").into_bytes())
+}
+
+/// Writes pre-serialized document bytes atomically.
+pub fn write_document(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_file_atomic(path, bytes, None).map_err(|error| error.to_string())
 }
 
 fn parse_index(raw: &str) -> Result<HistoryIndex, String> {
@@ -181,6 +195,12 @@ fn parse_index(raw: &str) -> Result<HistoryIndex, String> {
             sessions
                 .iter()
                 .filter(|value| is_session_summary(value))
+                .filter(|value| {
+                    value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_safe_session_id)
+                })
                 .filter_map(|value| serde_json::from_value(value.clone()).ok())
                 .collect()
         })
@@ -217,6 +237,17 @@ fn parse_session(raw: &str) -> Result<Vec<StoredMessage>, String> {
         .iter()
         .map(normalize_stored_message)
         .collect::<Vec<_>>())
+}
+
+const SESSION_ID_LIMIT: usize = 128;
+
+/// Session ids become file names, so a persisted index may only name safe single components.
+fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= SESSION_ID_LIMIT
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn is_session_summary(value: &Value) -> bool {
@@ -475,5 +506,58 @@ mod tests {
             Some("1200".to_owned())
         );
         assert!(usage.output_tokens.is_none());
+    }
+    #[test]
+    fn drops_persisted_index_entries_with_traversal_ids() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        let raw = json!({
+            "version": 1,
+            "activeSessionId": "../escape",
+            "sessions": [
+                { "id": "safe-session", "title": "Safe", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" },
+                { "id": "../escape", "title": "Escape", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" },
+                { "id": "a/b", "title": "Slash", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" }
+            ]
+        })
+        .to_string();
+        fs::write(store.index_path(), raw).expect("seed");
+
+        let loaded = store.load_index();
+
+        assert_eq!(
+            loaded
+                .index
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["safe-session"]
+        );
+        assert_eq!(
+            loaded.index.active_session_id.as_deref(),
+            Some("safe-session"),
+            "an unsafe active id must fall back to the first safe session"
+        );
+    }
+
+    #[test]
+    fn keeps_loading_when_every_persisted_id_is_unsafe() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        let raw = json!({
+            "version": 1,
+            "activeSessionId": "../../../etc/passwd",
+            "sessions": [
+                { "id": "../../../etc/passwd", "title": "Escape", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z" }
+            ]
+        })
+        .to_string();
+        fs::write(store.index_path(), raw).expect("seed");
+
+        let loaded = store.load_index();
+
+        assert!(loaded.index.sessions.is_empty());
+        assert!(loaded.index.active_session_id.is_none());
     }
 }

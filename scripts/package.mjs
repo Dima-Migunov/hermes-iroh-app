@@ -14,20 +14,20 @@ function run(command, args) {
 
 const version = JSON.parse(readFileSync('package.json', 'utf8')).version
 const targetDir = process.env.CARGO_TARGET_DIR || resolve('src-tauri', 'target')
+const bundleDir = resolve(targetDir, 'release', 'bundle')
 
-run('npm', ['run', 'tauri:sync'])
-run('npm', ['run', 'build'])
+// Versions are checked, never synced, in a build: a build must not mutate its inputs.
+run('npm', ['run', 'tauri:check'])
+// `beforeBuildCommand` runs the renderer build once, so it is not repeated here.
+run('npx', ['tauri', 'build', '--bundles', process.platform === 'linux' ? 'deb' : ''])
 
 if (process.platform === 'linux') {
-  run('npx', ['tauri', 'build', '--bundles', 'deb'])
   const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64'
   run('bash', [
     'scripts/build-appimage.sh',
     resolve(targetDir, 'release', 'hermes-iroh-app'),
     version,
     arch,
-    resolve(targetDir, 'release', 'bundle', 'appimage'),
+    resolve(bundleDir, 'appimage'),
   ])
-} else {
-  run('npx', ['tauri', 'build'])
 }

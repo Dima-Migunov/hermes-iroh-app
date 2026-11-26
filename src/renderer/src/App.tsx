@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getVersion } from '@tauri-apps/api/app'
 import { Composer } from './components/Composer'
 import { SettingsPage } from './components/SettingsPage'
@@ -22,7 +22,9 @@ export default function App() {
   const compact = useMediaQuery(COMPACT_BREAKPOINT)
   const sidebar = useSidebarState(compact)
   const settingsButtonRef = useRef<HTMLButtonElement>(null)
+  const sidebarToggleRef = useRef<HTMLButtonElement>(null)
   const returnFocusToSettingsRef = useRef(false)
+  const wasExpandedRef = useRef(sidebar.expanded)
 
   useEffect(() => {
     let active = true
@@ -48,6 +50,14 @@ export default function App() {
   }, [activeView])
 
   useEffect(() => {
+    const wasExpanded = wasExpandedRef.current
+    wasExpandedRef.current = sidebar.expanded
+    if (wasExpanded && !sidebar.expanded) {
+      sidebarToggleRef.current?.focus()
+    }
+  }, [sidebar.expanded])
+
+  useEffect(() => {
     if (!state.generating) return
 
     const handleKeyDown = (event: KeyboardEvent): void => {
@@ -60,27 +70,35 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [state.generating, cancelPrompt])
 
-  const closeSettings = (): void => {
+  const closeSettings = useCallback((): void => {
     returnFocusToSettingsRef.current = true
     setActiveView('chat')
-  }
+  }, [])
 
-  const openSettings = (): void => {
+  const openSettings = useCallback((): void => {
     sidebar.close()
     setActiveView('settings')
-  }
+  }, [sidebar])
 
-  const handleSessionCreate = (): void => {
+  const handleSessionCreate = useCallback((): void => {
     sidebar.close()
     setActiveView('chat')
     void chat.createSession()
-  }
+  }, [sidebar, chat])
 
-  const handleSessionSelect = (id: string): void => {
-    sidebar.close()
-    setActiveView('chat')
-    void chat.activateSession(id)
-  }
+  const handleSessionSelect = useCallback(
+    (id: string): void => {
+      sidebar.close()
+      setActiveView('chat')
+      void chat.activateSession(id)
+    },
+    [sidebar, chat],
+  )
+
+  const handleSessionBackdrop = useCallback((): void => sidebar.close(), [sidebar])
+  const handleCancel = useCallback((): void => {
+    void cancelPrompt()
+  }, [cancelPrompt])
 
   return (
     <div className={`app${compact ? ' app--compact' : ''}`}>
@@ -92,25 +110,26 @@ export default function App() {
         disabled={state.generating}
         version={version}
         status={state.connection}
+        toggleRef={sidebarToggleRef}
         settingsButtonRef={settingsButtonRef}
         onToggle={sidebar.toggle}
         onCreate={handleSessionCreate}
         onSelect={handleSessionSelect}
         onSettings={openSettings}
-        onBackdrop={sidebar.close}
+        onBackdrop={handleSessionBackdrop}
       />
 
       <main className="workspace">
         <div className="chat-view" hidden={activeView !== 'chat'}>
           <div className="notices">
-            {state.notices.map((notice, index) => (
-              <div key={`${notice.message}-${index}`} className="notice" role="status">
+            {state.notices.map((notice) => (
+              <div key={notice.id} className="notice" role="status">
                 <span>{notice.message}</span>
                 <button
                   type="button"
                   className="notice-dismiss"
                   aria-label="Dismiss notice"
-                  onClick={() => chat.dismissNotice(index)}
+                  onClick={() => chat.dismissNotice(notice.id)}
                 >
                   ×
                 </button>
@@ -128,18 +147,18 @@ export default function App() {
           ) : null}
 
           <Transcript
-            key={state.activeSessionId ?? 'empty'}
             messages={chat.messages}
             generating={state.generating}
             onCopy={chat.copyText}
           />
 
           <Composer
+            key={state.activeSessionId ?? 'empty'}
             disabled={state.activeSessionId === null}
             generating={state.generating}
             metadata={chat.latestMetadata}
             onSend={chat.sendPrompt}
-            onStop={() => void cancelPrompt()}
+            onStop={handleCancel}
           />
         </div>
 

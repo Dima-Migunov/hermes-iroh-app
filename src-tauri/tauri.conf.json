@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run tauri:sync && npm run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../out/renderer"
   },
   "app": {
@@ -29,7 +29,7 @@
     "category": "Utility",
     "shortDescription": "Desktop client for the Hermes Agent Iroh-channel plugin",
     "longDescription": "A desktop client that connects directly to a Hermes Agent server over Iroh and streams responses into a local chat UI.",
-    "copyright": "Copyright © 2026",
+    "copyright": "Copyright \u00a9 2026",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

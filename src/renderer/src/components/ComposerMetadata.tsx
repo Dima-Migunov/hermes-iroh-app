@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import type { ResponseMetadata } from '@shared/protocol'
 
 interface ComposerMetadataProps {
@@ -11,12 +12,14 @@ const COMPACT_NUMBER = new Intl.NumberFormat('en-US', {
 const PERCENT_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 })
 const USD_FORMAT = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
 
-export function ComposerMetadata({ metadata }: ComposerMetadataProps) {
+export const ComposerMetadata = memo(function ComposerMetadata({
+  metadata,
+}: ComposerMetadataProps) {
   const text = metadata ? statusText(metadata) : undefined
   if (!text) return null
 
   return <span className="composer-metadata">{text}</span>
-}
+})
 
 export function statusText(metadata: ResponseMetadata): string | undefined {
   const parts: string[] = []

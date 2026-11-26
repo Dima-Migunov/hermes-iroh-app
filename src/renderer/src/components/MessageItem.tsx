@@ -1,4 +1,5 @@
-import ReactMarkdown from 'react-markdown'
+import { memo } from 'react'
+import ReactMarkdown, { type Options as MarkdownOptions } from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeSanitize from 'rehype-sanitize'
 import remarkBreaks from 'remark-breaks'
@@ -11,7 +12,21 @@ interface MessageItemProps {
   onCopy: (text: string) => Promise<void>
 }
 
-export function MessageItem({ message, onCopy }: MessageItemProps) {
+const REMARK_PLUGINS: MarkdownOptions['remarkPlugins'] = [remarkGfm, remarkBreaks]
+const REHYPE_PLUGINS: MarkdownOptions['rehypePlugins'] = [rehypeSanitize, rehypeHighlight]
+
+const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
+  hour: '2-digit',
+  minute: '2-digit',
+})
+
+function formatTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return TIME_FORMAT.format(date)
+}
+
+export const MessageItem = memo(function MessageItem({ message, onCopy }: MessageItemProps) {
   const isUser = message.role === 'user'
 
   return (
@@ -30,10 +45,7 @@ export function MessageItem({ message, onCopy }: MessageItemProps) {
         <p className="thinking">Assistant is responding…</p>
       ) : (
         <div className="markdown">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkBreaks]}
-            rehypePlugins={[rehypeSanitize, rehypeHighlight]}
-          >
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>
             {message.content}
           </ReactMarkdown>
         </div>
@@ -54,10 +66,4 @@ export function MessageItem({ message, onCopy }: MessageItemProps) {
       ) : null}
     </li>
   )
-}
-
-function formatTime(value: string): string {
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-}
+})

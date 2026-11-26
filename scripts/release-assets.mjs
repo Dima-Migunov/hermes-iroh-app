@@ -1,27 +1,44 @@
 import { spawnSync } from 'node:child_process'
-import { copyFile, mkdir, readdir, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
 export const MAX_INSTALLER_BYTES = 25_000_000
 
 const INSTALLER_PATTERN = /\.(exe|dmg|zip|AppImage|deb|apk)$/
 
-export function publishedName({ kind, version, arch }) {
-  if (kind === 'exe') {
-    return `hermes-iroh-app-${version}-win-${arch === 'arm64' ? 'arm64' : 'x64'}.exe`
-  }
-  if (kind === 'dmg') {
-    return `hermes-iroh-app-${version}-mac-arm64.dmg`
-  }
-  if (kind === 'zip') {
-    return `hermes-iroh-app-${version}-mac-arm64.zip`
-  }
-  if (kind === 'apk') {
-    return `hermes-iroh-app-${version}-android-arm64.apk`
-  }
+/**
+ * The single source of truth for release asset naming and verification.
+ * `count` is the number of that asset the release publishes.
+ */
+export const RELEASE_ASSETS = Object.freeze([
+  Object.freeze({ kind: 'exe', platform: 'win', arch: 'x64', count: 1 }),
+  Object.freeze({ kind: 'exe', platform: 'win', arch: 'arm64', count: 1 }),
+  Object.freeze({ kind: 'dmg', platform: 'mac', arch: 'arm64', count: 1 }),
+  Object.freeze({ kind: 'zip', platform: 'mac', arch: 'arm64', count: 1 }),
+  Object.freeze({ kind: 'AppImage', platform: 'linux', arch: 'x86_64', count: 1 }),
+  Object.freeze({ kind: 'AppImage', platform: 'linux', arch: 'arm64', count: 1 }),
+  Object.freeze({ kind: 'deb', platform: 'linux', arch: 'amd64', count: 1 }),
+  Object.freeze({ kind: 'deb', platform: 'linux', arch: 'arm64', count: 1 }),
+  Object.freeze({ kind: 'apk', platform: 'android', arch: 'arm64', count: 1 }),
+])
 
-  const linuxArch = arch === 'arm64' ? 'arm64' : kind === 'AppImage' ? 'x86_64' : 'amd64'
-  return `hermes-iroh-app-${version}-linux-${linuxArch}.${kind}`
+export function publishedName({ kind, version, arch }) {
+  const asset = RELEASE_ASSETS.find((entry) => entry.kind === kind && entry.arch === arch)
+  if (!asset) {
+    throw new Error(`Unsupported release asset: ${kind}/${arch}`)
+  }
+  return `hermes-iroh-app-${version}-${asset.platform}-${asset.arch}.${asset.kind}`
+}
+
+/** Every asset name a release publishes for a given version. */
+export function expectedAssetNames(version) {
+  const names = []
+  for (const asset of RELEASE_ASSETS) {
+    for (let index = 0; index < asset.count; index += 1) {
+      names.push(publishedName({ kind: asset.kind, version, arch: asset.arch }))
+    }
+  }
+  return names.sort()
 }
 
 function archFromName(name, kind) {
@@ -29,6 +46,8 @@ function archFromName(name, kind) {
 
   const normalized = name.toLowerCase()
   if (normalized.includes('arm64') || normalized.includes('aarch64')) return 'arm64'
+  if (kind === 'AppImage') return 'x86_64'
+  if (kind === 'deb') return 'amd64'
   return 'x64'
 }
 
@@ -84,6 +103,7 @@ export async function collectAssets({
     throw new Error('A version is required.')
   }
 
+  await rm(outputDir, { recursive: true, force: true })
   await mkdir(outputDir, { recursive: true })
 
   const entries = []
@@ -96,11 +116,10 @@ export async function collectAssets({
 
   for (const entry of entries) {
     if (entry.directory && entry.path.endsWith('.app')) {
-      const destination = join(
-        outputDir,
-        publishedName({ kind: 'zip', version, arch: 'arm64' }),
-      )
-      if (destinations.has(destination)) continue
+      const destination = join(outputDir, publishedName({ kind: 'zip', version, arch: 'arm64' }))
+      if (destinations.has(destination)) {
+        throw new Error(`Two sources resolve to the same release asset: ${destination}`)
+      }
       await ditto(entry.path, destination)
       destinations.add(destination)
       assets.push({ source: entry.path, destination })
@@ -114,7 +133,11 @@ export async function collectAssets({
 
     const arch = archFromName(basename(entry.path), kind)
     const destination = join(outputDir, publishedName({ kind, version, arch }))
-    if (destinations.has(destination)) continue
+    if (destinations.has(destination)) {
+      throw new Error(
+        `Two sources resolve to the same release asset: ${destination} (from ${entry.path})`,
+      )
+    }
 
     await copyFile(entry.path, destination)
     destinations.add(destination)
@@ -122,6 +145,30 @@ export async function collectAssets({
   }
 
   return assets.sort((left, right) => left.destination.localeCompare(right.destination))
+}
+
+export async function verifyAssetSet(directory, version) {
+  const entries = await readdir(directory, { withFileTypes: true })
+  const present = entries
+    .filter((entry) => entry.isFile() && INSTALLER_PATTERN.test(entry.name))
+    .map((entry) => entry.name)
+    .sort()
+
+  const expected = expectedAssetNames(version)
+  const missing = expected.filter((name) => !present.includes(name))
+  const unexpected = present.filter((name) => !expected.includes(name))
+
+  if (missing.length > 0 || unexpected.length > 0) {
+    const details = [
+      missing.length > 0 ? `missing: ${missing.join(', ')}` : '',
+      unexpected.length > 0 ? `unexpected: ${unexpected.join(', ')}` : '',
+    ]
+      .filter(Boolean)
+      .join('; ')
+    throw new Error(`Release asset set is incomplete (${details})`)
+  }
+
+  return present
 }
 
 export async function checkInstallerSizes(directory, maxBytes = MAX_INSTALLER_BYTES) {

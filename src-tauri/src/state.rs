@@ -27,12 +27,20 @@ impl AppState {
     pub fn config(&self) -> ClientConfig {
         self.config_store
             .read()
-            .expect("the configuration lock is not poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_cached()
     }
 
     pub fn has_server_target(&self) -> bool {
         let config = self.config();
         config.server_ticket.is_some() || config.server_node_id.is_some()
+    }
+
+    /// Borrows the configuration store for a write, recovering a poisoned lock so a panic
+    /// elsewhere cannot make the settings unusable for the rest of the session.
+    pub fn write_config_store(&self) -> std::sync::RwLockWriteGuard<'_, ConfigStore> {
+        self.config_store
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }

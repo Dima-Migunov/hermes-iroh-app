@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react'
 import type {
   ClientConfig,
+  ErrorCode,
   PromptEvent,
   ResponseMetadata,
   StoredMessage,
@@ -14,9 +15,19 @@ import {
   type ChatState,
 } from './state/chatReducer'
 
+const DELTA_FLUSH_MS = 50
+
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message
   return typeof error === 'string' ? error : 'An unexpected error occurred.'
+}
+
+function errorCodeOf(error: unknown): ErrorCode {
+  if (error instanceof Error) {
+    const code = (error as unknown as { code?: unknown }).code
+    if (typeof code === 'string') return code as ErrorCode
+  }
+  return 'internal'
 }
 
 function createId(): string {
@@ -34,7 +45,12 @@ export interface ChatController {
   saveAndConnect(config: ClientConfig): Promise<ClientConfig>
   copyText(text: string): Promise<void>
   dismissError(): void
-  dismissNotice(index: number): void
+  dismissNotice(id: string): void
+}
+
+interface PendingDelta {
+  requestId: string
+  content: string
 }
 
 export function useChatController(): ChatController {
@@ -42,15 +58,32 @@ export function useChatController(): ChatController {
   const stateRef = useRef(state)
   stateRef.current = state
 
+  const selectionSeq = useRef(0)
+  const listSeq = useRef(0)
+  const submitting = useRef(false)
+
   useEffect(() => {
     const api = bridge
 
     let cancelled = false
     let frameId: number | null = null
-    const pendingDeltas: Array<{ requestId: string; content: string }> = []
+    let timerId: ReturnType<typeof setTimeout> | null = null
+    const pendingDeltas: PendingDelta[] = []
+
+    const cancelScheduledFlush = (): void => {
+      if (frameId !== null) {
+        cancelAnimationFrame(frameId)
+        frameId = null
+      }
+      if (timerId !== null) {
+        clearTimeout(timerId)
+        timerId = null
+      }
+    }
 
     const flushDeltas = (): void => {
       frameId = null
+      timerId = null
       if (pendingDeltas.length === 0) return
 
       const grouped = new Map<string, string[]>()
@@ -67,11 +100,14 @@ export function useChatController(): ChatController {
       }
     }
 
+    const scheduleFlush = (): void => {
+      if (frameId !== null || timerId !== null) return
+      frameId = requestAnimationFrame(flushDeltas)
+      timerId = setTimeout(flushDeltas, DELTA_FLUSH_MS)
+    }
+
     const flushNow = (): void => {
-      if (frameId !== null) {
-        cancelAnimationFrame(frameId)
-        frameId = null
-      }
+      cancelScheduledFlush()
       flushDeltas()
     }
 
@@ -80,7 +116,7 @@ export function useChatController(): ChatController {
 
       if (event.type === 'delta') {
         pendingDeltas.push({ requestId: event.requestId, content: event.content })
-        if (frameId === null) frameId = requestAnimationFrame(flushDeltas)
+        scheduleFlush()
         return
       }
 
@@ -89,17 +125,27 @@ export function useChatController(): ChatController {
 
       switch (event.type) {
         case 'start':
-          dispatch({ type: 'prompt/start', requestId: event.requestId, createdAt })
+          dispatch({
+            type: 'prompt/start',
+            requestId: event.requestId,
+            sessionId: event.sessionId,
+            createdAt,
+          })
           break
         case 'done':
           dispatch({
             type: 'prompt/done',
             requestId: event.requestId,
+            sessionId: event.sessionId,
             metadata: event.metadata,
           })
           break
         case 'cancelled':
-          dispatch({ type: 'prompt/cancelled', requestId: event.requestId })
+          dispatch({
+            type: 'prompt/cancelled',
+            requestId: event.requestId,
+            sessionId: event.sessionId,
+          })
           break
         case 'error':
           dispatch({
@@ -113,25 +159,29 @@ export function useChatController(): ChatController {
       }
     }
 
+    const refreshSessions = (): void => {
+      const sequence = ++listSeq.current
+      void api
+        .listSessions()
+        .then((sessions) => {
+          if (cancelled || sequence !== listSeq.current) return
+          dispatch({ type: 'sessions/set', sessions })
+        })
+        .catch(() => undefined)
+    }
+
     const unsubscribePrompt = api.onPromptEvent(handlePromptEvent)
     const unsubscribeStatus = api.onConnectionStatus((status) =>
       dispatch({ type: 'connection/set', status }),
     )
-    const unsubscribeHistory = api.onHistoryChanged(() => {
-      void api
-        .listSessions()
-        .then((sessions) => {
-          if (!cancelled) dispatch({ type: 'sessions/set', sessions })
-        })
-        .catch(() => undefined)
-    })
+    const unsubscribeHistory = api.onHistoryChanged(refreshSessions)
     const unsubscribeNotice = api.onNotice((notice) =>
       dispatch({ type: 'notice/add', notice }),
     )
 
     void (async () => {
-      try {
-        const [identity, config, connection, sessions, snapshot, notices] = await Promise.all([
+      const [identity, config, connection, sessions, snapshot, notices] =
+        await Promise.allSettled([
           api.getIdentity(),
           api.getConfig(),
           api.getConnectionStatus(),
@@ -139,28 +189,35 @@ export function useChatController(): ChatController {
           api.getActiveSession(),
           api.getNotices(),
         ])
-        if (cancelled) return
-        dispatch({
-          type: 'bootstrap',
-          identityNodeId: identity.nodeId,
-          config,
-          connection,
-          sessions,
-          snapshot,
-          notices,
-        })
-      } catch (error) {
-        if (cancelled) return
-        dispatch({
-          type: 'notice/add',
-          notice: { level: 'warning', message: messageOf(error) },
-        })
+      if (cancelled) return
+
+      const failures = [identity, config, connection, sessions, snapshot, notices]
+        .filter((result) => result.status === 'rejected')
+        .map((result) => messageOf((result as PromiseRejectedResult).reason))
+
+      for (const message of failures) {
+        dispatch({ type: 'notice/add', notice: { level: 'warning', message } })
       }
+
+      if (snapshot.status === 'rejected') return
+
+      dispatch({
+        type: 'bootstrap',
+        identityNodeId: identity.status === 'fulfilled' ? identity.value.nodeId : null,
+        config: config.status === 'fulfilled' ? config.value : null,
+        connection:
+          connection.status === 'fulfilled'
+            ? connection.value
+            : initialChatState.connection,
+        sessions: sessions.status === 'fulfilled' ? sessions.value : [],
+        snapshot: snapshot.value,
+        notices: notices.status === 'fulfilled' ? notices.value : [],
+      })
     })()
 
     return () => {
       cancelled = true
-      if (frameId !== null) cancelAnimationFrame(frameId)
+      cancelScheduledFlush()
       unsubscribePrompt()
       unsubscribeStatus()
       unsubscribeHistory()
@@ -174,14 +231,18 @@ export function useChatController(): ChatController {
     if (!current.activeSessionId || text.trim().length === 0 || current.generating) {
       return false
     }
+    if (submitting.current) return false
+    submitting.current = true
 
     const sessionId = current.activeSessionId
+    const createdAt = new Date().toISOString()
+    const requestId = `pending-${createId()}`
     dispatch({
       type: 'prompt/sent',
       sessionId,
       text,
       messageId: `local-${createId()}`,
-      createdAt: new Date().toISOString(),
+      createdAt,
     })
 
     try {
@@ -190,11 +251,13 @@ export function useChatController(): ChatController {
     } catch (error) {
       dispatch({
         type: 'prompt/error',
-        requestId: stateRef.current.activeRequestId ?? 'pending',
+        requestId,
         sessionId,
-        code: 'internal',
+        code: errorCodeOf(error),
         message: messageOf(error),
       })
+    } finally {
+      submitting.current = false
     }
 
     return true
@@ -213,8 +276,10 @@ export function useChatController(): ChatController {
   const createSession = useCallback(async (): Promise<void> => {
     const api = bridge
     if (stateRef.current.generating) return
+    const sequence = ++selectionSeq.current
     try {
       const session = await api.createSession()
+      if (sequence !== selectionSeq.current) return
       dispatch({ type: 'session/created', session })
     } catch (error) {
       dispatch({ type: 'notice/add', notice: { level: 'warning', message: messageOf(error) } })
@@ -225,8 +290,10 @@ export function useChatController(): ChatController {
     const api = bridge
     const current = stateRef.current
     if (current.generating || current.activeSessionId === id) return
+    const sequence = ++selectionSeq.current
     try {
       const snapshot = await api.activateSession(id)
+      if (sequence !== selectionSeq.current) return
       dispatch({ type: 'session/activated', snapshot })
     } catch (error) {
       dispatch({ type: 'notice/add', notice: { level: 'warning', message: messageOf(error) } })
@@ -253,7 +320,7 @@ export function useChatController(): ChatController {
 
   const dismissError = useCallback(() => dispatch({ type: 'error/dismiss' }), [])
   const dismissNotice = useCallback(
-    (index: number) => dispatch({ type: 'notice/dismiss', index }),
+    (id: string) => dispatch({ type: 'notice/dismiss', id }),
     [],
   )
 

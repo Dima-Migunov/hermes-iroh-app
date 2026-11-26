@@ -13,10 +13,14 @@ export function Transcript({ messages, generating, onCopy }: TranscriptProps) {
   const pinnedRef = useRef(true)
 
   useLayoutEffect(() => {
-    const container = containerRef.current
-    if (container && pinnedRef.current) {
-      container.scrollTop = container.scrollHeight
-    }
+    const frame = requestAnimationFrame(() => {
+      const container = containerRef.current
+      if (container && pinnedRef.current) {
+        container.scrollTop = container.scrollHeight
+      }
+    })
+
+    return () => cancelAnimationFrame(frame)
   }, [messages])
 
   const handleScroll = (): void => {

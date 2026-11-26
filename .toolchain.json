@@ -1,0 +1,5 @@
+{
+  "androidPlatforms": ["37.0", "37.2"],
+  "androidBuildTools": ["37.0.0"],
+  "androidNdk": "30.0.16248370"
+}

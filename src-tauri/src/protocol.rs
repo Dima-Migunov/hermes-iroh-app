@@ -485,6 +485,13 @@ impl<'a> PromptStateMachine<'a> {
                 });
             }
             ServerFrame::Done { metadata } => {
+                if !self.started {
+                    self.fail(
+                        ErrorCode::Protocol,
+                        "The server sent a done frame before the start frame.",
+                    );
+                    return;
+                }
                 self.terminal = true;
                 (self.emit)(PromptEvent::Done {
                     request_id: self.request_id.clone(),
@@ -508,10 +515,17 @@ impl<'a> PromptStateMachine<'a> {
         if self.terminal {
             return;
         }
-        self.fail(
-            ErrorCode::ConnectionClosed,
-            crate::errors::early_close_message(),
-        );
+        if self.started {
+            self.fail(
+                ErrorCode::ConnectionClosed,
+                "The server closed the connection before the response finished.",
+            );
+        } else {
+            self.fail(
+                ErrorCode::ConnectionClosed,
+                crate::errors::early_close_message(),
+            );
+        }
     }
 
     pub fn handle_transport_error(&mut self, error: &(dyn std::error::Error + 'static)) {
@@ -766,6 +780,85 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        assert!(settled);
+    }
+
+    #[test]
+    fn reports_eof_after_start_without_the_allowlist_hint() {
+        let (events, settled) = run(|machine| {
+            machine.handle_frame(ServerFrame::Start {
+                session_id: "session-1".to_owned(),
+            });
+            machine.handle_eof();
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "error"]);
+        match &events[1] {
+            PromptEvent::Error { code, message, .. } => {
+                assert_eq!(*code, ErrorCode::ConnectionClosed);
+                assert!(
+                    !message.contains("/iroh_allow"),
+                    "the allowlist hint only applies before any response began"
+                );
+                assert!(message.contains("before the response finished"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(settled);
+    }
+
+    #[test]
+    fn reports_eof_after_deltas_as_a_close_after_start() {
+        let (events, settled) = run(|machine| {
+            machine.handle_frame(ServerFrame::Start {
+                session_id: "session-1".to_owned(),
+            });
+            machine.handle_frame(ServerFrame::Delta {
+                content: "partial".to_owned(),
+            });
+            machine.handle_eof();
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "delta", "error"]);
+        assert!(matches!(
+            &events[2],
+            PromptEvent::Error {
+                code: ErrorCode::ConnectionClosed,
+                message,
+                ..
+            } if !message.contains("/iroh_allow")
+        ));
+        assert!(settled);
+    }
+
+    #[test]
+    fn rejects_a_done_frame_before_start_as_a_protocol_violation() {
+        let (events, settled) = run(|machine| {
+            machine.handle_frame(ServerFrame::Done { metadata: None });
+        });
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            PromptEvent::Error {
+                code: ErrorCode::Protocol,
+                message,
+                ..
+            } if message.contains("before the start frame")
+        ));
+        assert!(settled);
+    }
+
+    #[test]
+    fn accepts_done_after_start() {
+        let (events, settled) = run(|machine| {
+            machine.handle_frame(ServerFrame::Start {
+                session_id: "session-1".to_owned(),
+            });
+            machine.handle_frame(ServerFrame::Done { metadata: None });
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "done"]);
         assert!(settled);
     }
 

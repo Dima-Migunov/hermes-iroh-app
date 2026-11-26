@@ -12,6 +12,7 @@ interface SidebarProps {
   disabled: boolean
   version: string | null
   status: ConnectionStatus
+  toggleRef?: RefObject<HTMLButtonElement | null>
   settingsButtonRef?: RefObject<HTMLButtonElement | null>
   onToggle: () => void
   onCreate: () => void
@@ -28,6 +29,7 @@ export function Sidebar({
   disabled,
   version,
   status,
+  toggleRef,
   settingsButtonRef,
   onToggle,
   onCreate,
@@ -68,6 +70,7 @@ export function Sidebar({
             ) : null}
           </div>
           <button
+            ref={toggleRef}
             type="button"
             className="sidebar-toggle"
             onClick={onToggle}

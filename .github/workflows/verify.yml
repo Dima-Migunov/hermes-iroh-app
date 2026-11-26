@@ -1,0 +1,40 @@
+name: Verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: echo "node=$(node scripts/toolchain.mjs node)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+          cache: npm
+      - run: npm ci
+      - name: Verify version manifests and the tag
+        run: npm run tauri:check
+      - run: npm run typecheck
+      - run: npm test
+      - uses: ./.github/actions/install-linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Rust lint
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - name: Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check

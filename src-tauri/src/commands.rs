@@ -10,6 +10,7 @@ use crate::protocol::{
     SessionSummary,
 };
 use crate::state::AppState;
+use crate::storage::config::normalize_config;
 
 const SESSION_ID_LIMIT: usize = 128;
 const PROMPT_TEXT_LIMIT: usize = 200_000;
@@ -24,9 +25,44 @@ pub struct IdentityResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PromptPayload {
+pub struct PromptPayload {
     session_id: String,
     text: String,
+}
+
+/// A configuration field that must be present and is either a string or `null`.
+/// The inner option holds the value; the outer flag records whether the key was present.
+#[derive(Debug, Default)]
+pub struct Present<T> {
+    pub present: bool,
+    pub value: Option<T>,
+}
+
+impl<'de, T> Deserialize<'de> for Present<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(|value| Present {
+            present: true,
+            value,
+        })
+    }
+}
+
+/// Typed configuration payload: every field must be present and is a string or null.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigPayload {
+    #[serde(default)]
+    server_ticket: Present<String>,
+    #[serde(default)]
+    server_node_id: Present<String>,
+    #[serde(default)]
+    relay_url: Present<String>,
 }
 
 fn ensure_main_window(window: &WebviewWindow) -> Result<(), AppError> {
@@ -58,69 +94,71 @@ fn require_length(
     Ok(())
 }
 
-fn parse_config(value: Value) -> Result<ClientConfig, AppError> {
-    let object = value.as_object().ok_or_else(|| {
-        AppError::configuration("Invalid request on config:save: payload must be an object.")
-    })?;
-
-    for key in object.keys() {
-        if !["serverTicket", "serverNodeId", "relayUrl"].contains(&key.as_str()) {
+fn parse_config(payload: ConfigPayload) -> Result<ClientConfig, AppError> {
+    for (field, present) in [
+        ("serverTicket", payload.server_ticket.present),
+        ("serverNodeId", payload.server_node_id.present),
+        ("relayUrl", payload.relay_url.present),
+    ] {
+        if !present {
             return Err(AppError::configuration(format!(
-                "Invalid request on config:save: unknown field `{key}`"
+                "Invalid request on config:save: missing field `{field}`"
             )));
         }
     }
 
-    let server_ticket = read_required_nullable(object, "serverTicket")?;
-    let server_node_id = read_required_nullable(object, "serverNodeId")?;
-    let relay_url = read_required_nullable(object, "relayUrl")?;
+    let config = ClientConfig {
+        server_ticket: payload.server_ticket.value,
+        server_node_id: payload.server_node_id.value,
+        relay_url: payload.relay_url.value,
+    };
+
+    // The ticket wins over a bare NodeId, exactly as on the disk path.
+    let config = normalize_config(&config);
 
     for (field, value) in [
-        ("serverTicket", server_ticket.as_deref()),
-        ("serverNodeId", server_node_id.as_deref()),
-        ("relayUrl", relay_url.as_deref()),
+        ("serverTicket", config.server_ticket.as_deref()),
+        ("serverNodeId", config.server_node_id.as_deref()),
+        ("relayUrl", config.relay_url.as_deref()),
     ] {
         if let Some(value) = value {
             require_length(value, field, 0, CONFIG_FIELD_LIMIT)?;
         }
     }
 
-    Ok(ClientConfig {
-        server_ticket,
-        server_node_id,
-        relay_url,
-    })
-}
-
-fn read_required_nullable(
-    object: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<Option<String>, AppError> {
-    match object.get(field) {
-        None => Err(AppError::configuration(format!(
-            "Invalid request on config:save: missing field `{field}`"
-        ))),
-        Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(_) => Err(AppError::configuration(format!(
-            "Invalid request on config:save: field `{field}` must be a string or null"
-        ))),
-    }
+    Ok(config)
 }
 
 fn parse_session_id(value: Value) -> Result<String, AppError> {
     let session_id = value.as_str().ok_or_else(|| {
         AppError::configuration("Invalid request: the session id must be a string.")
     })?;
-    require_length(session_id, "sessionId", 1, SESSION_ID_LIMIT)?;
+    validate_session_id(session_id)?;
     Ok(session_id.to_owned())
 }
 
-fn parse_prompt(value: Value) -> Result<PromptSubmission, AppError> {
-    let payload: PromptPayload = serde_json::from_value(value).map_err(|error| {
-        AppError::configuration(format!("Invalid request on prompt:send: {error}"))
-    })?;
-    require_length(&payload.session_id, "sessionId", 1, SESSION_ID_LIMIT)?;
+/// A session id becomes a file name, so it must stay inside the history directory and
+/// resolve to a single component on every supported platform.
+pub fn validate_session_id(session_id: &str) -> Result<(), AppError> {
+    let length = session_id.len();
+    if length == 0 || length > SESSION_ID_LIMIT {
+        return Err(AppError::configuration(format!(
+            "Invalid request: sessionId must be between 1 and {SESSION_ID_LIMIT} characters."
+        )));
+    }
+    let valid = session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !valid {
+        return Err(AppError::configuration(
+            "Invalid request: sessionId may only contain letters, digits, underscores, and hyphens.",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_prompt(payload: PromptPayload) -> Result<PromptSubmission, AppError> {
+    validate_session_id(&payload.session_id)?;
     require_length(&payload.text, "text", 1, PROMPT_TEXT_LIMIT)?;
     Ok(PromptSubmission {
         session_id: payload.session_id,
@@ -160,16 +198,13 @@ pub async fn config_get(
 pub async fn config_save(
     window: WebviewWindow,
     state: State<'_, AppState>,
-    payload: Value,
+    payload: ConfigPayload,
 ) -> Result<ClientConfig, AppError> {
     ensure_main_window(&window)?;
     let config = parse_config(payload)?;
 
     let (previous, saved) = {
-        let mut store = state
-            .config_store
-            .write()
-            .map_err(|_| AppError::internal("The configuration lock is unavailable."))?;
+        let mut store = state.write_config_store();
         let previous = store.get_cached();
         let saved = store.save(config)?;
         (previous, saved)
@@ -266,7 +301,7 @@ pub async fn sessions_get_active(
 pub async fn prompt_send(
     window: WebviewWindow,
     state: State<'_, AppState>,
-    payload: Value,
+    payload: PromptPayload,
 ) -> Result<PromptSubmissionResult, AppError> {
     ensure_main_window(&window)?;
     let input = parse_prompt(payload)?;
@@ -314,75 +349,100 @@ mod tests {
     use crate::errors::ErrorCode;
     use serde_json::json;
 
+    fn config_payload(value: serde_json::Value) -> ConfigPayload {
+        serde_json::from_value(value).expect("config payload")
+    }
+
+    fn prompt_payload(value: serde_json::Value) -> PromptPayload {
+        serde_json::from_value(value).expect("prompt payload")
+    }
+
     #[test]
     fn parses_a_valid_configuration() {
-        let config = parse_config(json!({
+        let config = parse_config(config_payload(json!({
             "serverTicket": "ticket",
             "serverNodeId": null,
             "relayUrl": null
-        }))
+        })))
         .expect("config");
         assert_eq!(config.server_ticket.as_deref(), Some("ticket"));
     }
 
     #[test]
     fn rejects_unknown_configuration_fields() {
-        let error = parse_config(json!({
+        let error = serde_json::from_value::<ConfigPayload>(json!({
             "serverTicket": "ticket",
             "serverNodeId": null,
             "relayUrl": null,
             "extra": true
         }))
         .expect_err("unknown field");
-        assert_eq!(error.code, ErrorCode::Configuration);
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
     fn rejects_missing_configuration_fields() {
-        let error = parse_config(json!({ "serverTicket": "ticket" })).expect_err("missing");
+        let error = parse_config(config_payload(json!({
+            "serverTicket": "ticket",
+            "serverNodeId": null
+        })))
+        .expect_err("missing");
         assert_eq!(error.code, ErrorCode::Configuration);
+        assert!(error.message.contains("relayUrl"));
+    }
+
+    #[test]
+    fn rejects_a_wrong_type_configuration_field() {
+        let error = serde_json::from_value::<ConfigPayload>(json!({
+            "serverTicket": 3,
+            "serverNodeId": null,
+            "relayUrl": null
+        }))
+        .expect_err("wrong type");
+        assert!(
+            error.to_string().contains("expected a string"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn rejects_oversized_configuration_fields() {
-        let error = parse_config(json!({
+        let error = parse_config(config_payload(json!({
             "serverTicket": "x".repeat(CONFIG_FIELD_LIMIT + 1),
             "serverNodeId": null,
             "relayUrl": null
-        }))
+        })))
         .expect_err("oversized");
         assert_eq!(error.code, ErrorCode::Configuration);
     }
 
     #[test]
     fn rejects_a_malformed_prompt() {
-        assert_eq!(
-            parse_prompt(json!({ "sessionId": "session-1" }))
-                .expect_err("missing text")
-                .code,
-            ErrorCode::Configuration
+        assert!(
+            serde_json::from_value::<PromptPayload>(json!({ "sessionId": "session-1" })).is_err()
         );
-        assert_eq!(
-            parse_prompt(json!({ "sessionId": "session-1", "text": 5 }))
-                .expect_err("wrong text type")
-                .code,
-            ErrorCode::Configuration
-        );
+        assert!(serde_json::from_value::<PromptPayload>(
+            json!({ "sessionId": "session-1", "text": 5 })
+        )
+        .is_err());
     }
 
     #[test]
     fn rejects_oversized_prompt_fields() {
         assert_eq!(
-            parse_prompt(json!({ "sessionId": "x".repeat(SESSION_ID_LIMIT + 1), "text": "hi" }))
-                .expect_err("oversized session")
-                .code,
+            parse_prompt(prompt_payload(json!({
+                "sessionId": "x".repeat(SESSION_ID_LIMIT + 1),
+                "text": "hi"
+            })))
+            .expect_err("oversized session")
+            .code,
             ErrorCode::Configuration
         );
         assert_eq!(
-            parse_prompt(json!({
+            parse_prompt(prompt_payload(json!({
                 "sessionId": "session-1",
                 "text": "x".repeat(PROMPT_TEXT_LIMIT + 1)
-            }))
+            })))
             .expect_err("oversized prompt")
             .code,
             ErrorCode::Configuration
@@ -438,5 +498,61 @@ mod tests {
                 .code,
             ErrorCode::Configuration
         );
+    }
+
+    #[test]
+    fn rejects_session_ids_that_could_escape_the_history_directory() {
+        for id in [
+            "../escape",
+            "..",
+            "a/b",
+            "a\\b",
+            "with space",
+            "nul\0",
+            "",
+            &"x".repeat(SESSION_ID_LIMIT + 1),
+        ] {
+            let error = parse_session_id(json!(id)).expect_err("unsafe session id");
+            assert_eq!(
+                error.code,
+                ErrorCode::Configuration,
+                "session id {id:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_uuid_style_session_ids() {
+        for id in [
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "session_1",
+            "ABC-123_x",
+        ] {
+            assert_eq!(parse_session_id(json!(id)).expect("valid session id"), id);
+        }
+    }
+
+    #[test]
+    fn rejects_an_unsafe_session_id_supplied_through_prompt_send() {
+        let error = parse_prompt(prompt_payload(json!({
+            "sessionId": "../../etc/passwd",
+            "text": "hi"
+        })))
+        .expect_err("unsafe prompt session");
+        assert_eq!(error.code, ErrorCode::Configuration);
+    }
+    #[test]
+    fn accepts_a_typed_prompt_payload_without_a_second_conversion() {
+        let payload = prompt_payload(json!({ "sessionId": "session-1", "text": "hello" }));
+        let submission = parse_prompt(payload).expect("prompt");
+        assert_eq!(submission.session_id, "session-1");
+        assert_eq!(submission.text, "hello");
+    }
+
+    #[test]
+    fn accepts_a_short_prompt_at_the_boundary() {
+        let title_source = "x".repeat(PROMPT_TEXT_LIMIT);
+        let payload = prompt_payload(json!({ "sessionId": "session-1", "text": title_source }));
+        assert!(parse_prompt(payload).is_ok());
     }
 }

@@ -409,7 +409,7 @@ fn handle_run_event(app_handle: &AppHandle, event: RunEvent) {
             }
             Lifecycle::Resume => {
                 if has_target {
-                    client.connect().await;
+                    client.restart().await;
                 }
             }
         }
