@@ -108,8 +108,11 @@ if (mode === 'check') {
     }
   }
 
+  // On a branch push GITHUB_REF_NAME is the branch name, so only compare it with the
+  // version when GitHub reports that the ref is a tag.
+  const refType = process.env.GITHUB_REF_TYPE
   const tag = process.env.GITHUB_REF_NAME
-  if (tag !== undefined && tag.length > 0) {
+  if (refType === 'tag' && tag !== undefined && tag.length > 0) {
     const expectedTag = `v${packageVersion}`
     if (tag !== expectedTag) {
       errors.push(`Tag ${tag} does not match package.json version ${expectedTag}`)

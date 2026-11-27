@@ -32,7 +32,7 @@ function run(workspace, mode = 'check') {
   return spawnSync(process.execPath, [join(workspace, 'scripts', 'tauri-version.mjs'), mode], {
     cwd: workspace,
     encoding: 'utf8',
-    env: { ...process.env, GITHUB_REF_NAME: '' },
+    env: { ...process.env, GITHUB_REF_NAME: '', GITHUB_REF_TYPE: '' },
   })
 }
 
@@ -87,11 +87,23 @@ describe('version synchronization', () => {
     const result = spawnSync(process.execPath, [join(workspace, 'scripts', 'tauri-version.mjs'), 'check'], {
       cwd: workspace,
       encoding: 'utf8',
-      env: { ...process.env, GITHUB_REF_NAME: 'v9.9.9' },
+      env: { ...process.env, GITHUB_REF_NAME: 'v9.9.9', GITHUB_REF_TYPE: 'tag' },
     })
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain(`v${version}`)
+  })
+
+  it('ignores the ref name on a branch push', async () => {
+    const workspace = await createWorkspace()
+    const result = spawnSync(process.execPath, [join(workspace, 'scripts', 'tauri-version.mjs'), 'check'], {
+      cwd: workspace,
+      encoding: 'utf8',
+      env: { ...process.env, GITHUB_REF_NAME: 'main', GITHUB_REF_TYPE: 'branch' },
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('is consistent')
   })
 
   it('syncs a drifted manifest back to the package version', async () => {
