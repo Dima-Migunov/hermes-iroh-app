@@ -135,6 +135,21 @@ export function useChatController(): ChatController {
             createdAt,
           })
           break
+        case 'tool':
+          dispatch({
+            type: 'prompt/tool',
+            requestId: event.requestId,
+            sessionId: event.sessionId,
+            toolCall: {
+              id: event.id,
+              name: event.name,
+              arguments: event.arguments,
+              truncated: event.truncated,
+              lineIndex: event.lineIndex,
+            },
+            createdAt,
+          })
+          break
         case 'done':
           dispatch({
             type: 'prompt/done',

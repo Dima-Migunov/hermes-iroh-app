@@ -8,7 +8,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::metadata::normalize_response_metadata;
-use crate::protocol::{MessageRole, MessageStatus, SessionSummary, StoredError, StoredMessage};
+use crate::protocol::{
+    MessageRole, MessageStatus, SessionSummary, StoredError, StoredMessage, ToolCall,
+};
 use crate::storage::atomic_file::write_file_atomic;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -311,8 +313,58 @@ fn normalize_stored_message(value: &Value) -> StoredMessage {
             .unwrap_or_default()
             .to_owned(),
         status,
+        tool_calls: record.get("toolCalls").and_then(normalize_tool_calls),
         error: record.get("error").and_then(parse_stored_error),
         metadata: record.get("metadata").and_then(normalize_response_metadata),
+    }
+}
+
+const TOOL_CALL_LIMIT: usize = 64;
+
+fn normalize_tool_calls(value: &Value) -> Option<Vec<ToolCall>> {
+    let entries = value.as_array()?;
+    let mut calls = Vec::new();
+
+    for entry in entries {
+        if calls.len() >= TOOL_CALL_LIMIT {
+            break;
+        }
+        let Some(record) = entry.as_object() else {
+            continue;
+        };
+        let Some(name) = record.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(arguments) = record.get("arguments").filter(|value| value.is_object()) else {
+            continue;
+        };
+        let Some(line_index) = record
+            .get("lineIndex")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+
+        calls.push(ToolCall {
+            id: record.get("id").and_then(Value::as_str).map(str::to_owned),
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+            truncated: record
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            line_index,
+        });
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
     }
 }
 
@@ -336,7 +388,7 @@ fn preserve_corrupt_file(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ResponseMetadata, SessionSummary, StoredMessage};
+    use crate::protocol::{ResponseMetadata, SessionSummary, StoredMessage, ToolCall};
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
@@ -362,6 +414,7 @@ mod tests {
             content: "hello".to_owned(),
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             status: MessageStatus::Complete,
+            tool_calls: None,
             error: None,
             metadata: None,
         }
@@ -504,7 +557,134 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].id, "old-message");
         assert!(loaded.messages[0].metadata.is_none());
+        assert!(loaded.messages[0].tool_calls.is_none());
         assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn round_trips_tool_calls() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        let mut assistant = message("message-1");
+        assistant.tool_calls = Some(vec![
+            ToolCall {
+                id: Some("call-1".to_owned()),
+                name: "search".to_owned(),
+                arguments: json!({ "query": "docs", "nested": { "depth": 2 } }),
+                truncated: true,
+                line_index: 0,
+            },
+            ToolCall {
+                id: None,
+                name: "read".to_owned(),
+                arguments: json!({ "path": "README.md" }),
+                truncated: false,
+                line_index: 3,
+            },
+        ]);
+
+        store
+            .save_session("session-1", std::slice::from_ref(&assistant))
+            .expect("save");
+        let raw: Value = serde_json::from_str(
+            &fs::read_to_string(store.session_path("session-1")).expect("read"),
+        )
+        .expect("json");
+        let calls = raw["messages"][0]["toolCalls"].as_array().expect("calls");
+        assert_eq!(calls[0]["lineIndex"], 0);
+        assert_eq!(calls[0]["truncated"], true);
+        assert!(calls[1].get("id").is_none());
+        assert!(calls[1].get("truncated").is_none());
+
+        let loaded = store.load_session("session-1");
+        assert_eq!(loaded.messages, vec![assistant]);
+        assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn skips_unusable_tool_calls_and_keeps_valid_ones() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        fs::write(
+            store.session_path("session-1"),
+            json!({
+                "version": 1,
+                "sessionId": "session-1",
+                "messages": [{
+                    "id": "m1",
+                    "role": "assistant",
+                    "content": "answer",
+                    "createdAt": "2026-01-01T00:00:00.000Z",
+                    "status": "complete",
+                    "toolCalls": [
+                        { "name": "search", "arguments": { "query": "docs" }, "lineIndex": 0 },
+                        "not an object",
+                        { "name": "", "arguments": {}, "lineIndex": 1 },
+                        { "name": "no-object-args", "arguments": [1, 2], "lineIndex": 2 },
+                        { "name": "negative-index", "arguments": {}, "lineIndex": -1 },
+                        { "name": "float-index", "arguments": {}, "lineIndex": 1.5 },
+                        { "name": "string-index", "arguments": {}, "lineIndex": "3" },
+                        {
+                            "name": "read",
+                            "arguments": { "path": "README.md" },
+                            "lineIndex": 2,
+                            "id": 42,
+                            "truncated": "yes"
+                        }
+                    ]
+                }]
+            })
+            .to_string(),
+        )
+        .expect("seed");
+
+        let loaded = store.load_session("session-1");
+
+        assert!(loaded.warning.is_none());
+        let message = loaded.messages.first().expect("message");
+        let calls = message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["query"], "docs");
+        assert_eq!(calls[0].line_index, 0);
+        assert!(!calls[0].truncated);
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].id, None);
+        assert!(!calls[1].truncated);
+        assert_eq!(calls[1].line_index, 2);
+    }
+
+    #[test]
+    fn keeps_a_message_when_every_tool_call_is_unusable() {
+        let directory = temporary_directory();
+        let store = HistoryStore::new(&directory);
+        fs::write(
+            store.session_path("session-1"),
+            json!({
+                "version": 1,
+                "sessionId": "session-1",
+                "messages": [{
+                    "id": "m1",
+                    "role": "assistant",
+                    "content": "answer",
+                    "createdAt": "2026-01-01T00:00:00.000Z",
+                    "status": "complete",
+                    "toolCalls": [
+                        { "name": "", "arguments": {}, "lineIndex": 0 },
+                        { "name": "missing-arguments", "lineIndex": 1 },
+                        null
+                    ]
+                }]
+            })
+            .to_string(),
+        )
+        .expect("seed");
+
+        let loaded = store.load_session("session-1");
+
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(loaded.messages[0].tool_calls.is_none());
     }
 
     #[test]

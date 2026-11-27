@@ -1044,6 +1044,99 @@ textarea:disabled {
   color: var(--accent);
 }
 
+.message-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-progress {
+  display: block;
+}
+
+.tool-progress__row {
+  display: block;
+  width: 100%;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.5;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: help;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.tool-progress__row:hover,
+.tool-progress__row--active {
+  background: var(--panel-raised);
+  border-color: var(--border);
+}
+
+.tool-progress__row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.tool-progress__tooltip {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-raised);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow: auto;
+  pointer-events: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  transition: opacity 120ms ease;
+}
+
+/* Bridge the gap to the row so moving the pointer into the card, or scrolling
+   its content, does not dismiss it. */
+.tool-progress__tooltip::before {
+  content: '';
+  position: absolute;
+  right: 0;
+  left: 0;
+  height: 8px;
+}
+
+.tool-progress__tooltip[data-placement='below']::before {
+  top: -8px;
+}
+
+.tool-progress__tooltip[data-placement='above']::before {
+  bottom: -8px;
+}
+
+.tool-progress__tooltip-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tool-progress__tooltip-arguments {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tool-progress__tooltip-truncated {
+  margin: 0;
+  color: var(--warning);
+}
+
 .composer {
   display: flex;
   flex-direction: column;
@@ -1200,7 +1293,9 @@ textarea:disabled {
 
   .user-message-rail__marker,
   .user-message-rail__line,
-  .user-message-rail__tooltip {
+  .user-message-rail__tooltip,
+  .tool-progress__row,
+  .tool-progress__tooltip {
     transition: none;
   }
 

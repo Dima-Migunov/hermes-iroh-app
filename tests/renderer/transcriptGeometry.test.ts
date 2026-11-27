@@ -4,10 +4,14 @@ import {
   RAIL_BOTTOM_INSET_PX,
   RAIL_MARKER_HEIGHT_PX,
   RAIL_TOP_INSET_PX,
+  TOOLTIP_GAP_PX,
+  TOOLTIP_MAX_HEIGHT_RATIO,
+  TOOLTIP_MAX_WIDTH_PX,
   clampTooltipTop,
   markerTopForDestination,
   markerTopsForDestinations,
   messageScrollDestination,
+  placeTooltip,
   spreadMarkerTops,
 } from '@renderer/transcriptGeometry'
 
@@ -101,6 +105,72 @@ describe('clampTooltipTop', () => {
 
   it('never returns a negative top for a short chat area', () => {
     expect(clampTooltipTop(5, 300, 200, 12)).toBe(0)
+  })
+})
+
+describe('placeTooltip', () => {
+  const viewport = { top: 0, bottom: 800, left: 0, right: 1000 }
+  const anchor = { top: 100, bottom: 120, left: 200, right: 300 }
+
+  it('places the tooltip below the row and centers it', () => {
+    const placement = placeTooltip(anchor, viewport, { width: 240, height: 120 })
+
+    expect(placement).toMatchObject({ top: 120 + TOOLTIP_GAP_PX, left: 130, above: false })
+    expect(placement.maxWidth).toBe(TOOLTIP_MAX_WIDTH_PX)
+    expect(placement.maxHeight).toBe(800 * TOOLTIP_MAX_HEIGHT_RATIO)
+  })
+
+  it('flips above a row near the bottom edge', () => {
+    const placement = placeTooltip(
+      { top: 700, bottom: 720, left: 200, right: 300 },
+      viewport,
+      { width: 240, height: 120 },
+    )
+
+    expect(placement).toMatchObject({
+      top: 700 - TOOLTIP_GAP_PX - 120,
+      above: true,
+    })
+  })
+
+  it('clamps the left edge inside a wide viewport', () => {
+    const placement = placeTooltip(
+      { top: 100, bottom: 120, left: 950, right: 990 },
+      viewport,
+      { width: 240, height: 120 },
+    )
+
+    expect(placement.left).toBe(1000 - 12 - 240)
+  })
+
+  it('falls back to the available width on a narrow viewport', () => {
+    const placement = placeTooltip(anchor, { ...viewport, right: 320 }, {
+      width: 480,
+      height: 120,
+    })
+
+    expect(placement.maxWidth).toBe(320 - 24)
+    expect(placement.left).toBe(12)
+  })
+
+  it('bounds a long tooltip and keeps it inside the viewport', () => {
+    const placement = placeTooltip(anchor, viewport, { width: 240, height: 900 })
+
+    expect(placement.maxHeight).toBe(800 * TOOLTIP_MAX_HEIGHT_RATIO)
+    expect(placement.top).toBeGreaterThanOrEqual(12)
+    expect(placement.top + placement.maxHeight).toBeLessThanOrEqual(800 - 12)
+  })
+
+  it('never returns a position outside a short chat area', () => {
+    const placement = placeTooltip(
+      { top: 100, bottom: 120, left: 100, right: 200 },
+      { top: 0, bottom: 200, left: 0, right: 400 },
+      { width: 240, height: 120 },
+    )
+
+    expect(placement.top).toBeGreaterThanOrEqual(12)
+    expect(placement.maxHeight).toBeGreaterThan(0)
+    expect(placement.top + placement.maxHeight).toBeLessThanOrEqual(200 - 12)
   })
 })
 

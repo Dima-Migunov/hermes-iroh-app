@@ -230,12 +230,26 @@ pub struct StoredError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Value,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    pub line_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredMessage {
     pub id: String,
     pub role: MessageRole,
     pub content: String,
     pub created_at: String,
     pub status: MessageStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<StoredError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -285,6 +299,16 @@ pub enum PromptEvent {
         request_id: String,
         content: String,
     },
+    Tool {
+        request_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        name: String,
+        arguments: Value,
+        truncated: bool,
+        line_index: usize,
+    },
     Done {
         request_id: String,
         session_id: String,
@@ -332,6 +356,12 @@ pub enum ServerFrame {
     },
     Delta {
         content: String,
+    },
+    Tool {
+        id: Option<String>,
+        name: String,
+        arguments: Value,
+        truncated: bool,
     },
     Done {
         metadata: Option<Box<ResponseMetadata>>,
@@ -405,6 +435,27 @@ pub fn parse_server_frame(line: &str) -> Result<Option<ServerFrame>, crate::erro
                 content: content.to_owned(),
             }))
         }
+        "tool" => {
+            let name = record
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(arguments) = record.get("arguments").filter(|value| value.is_object()) else {
+                return Ok(None);
+            };
+            if name.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ServerFrame::Tool {
+                id: record.get("id").and_then(Value::as_str).map(str::to_owned),
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+                truncated: record
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }))
+        }
         "done" => {
             let metadata = record
                 .get("metadata")
@@ -433,6 +484,18 @@ pub struct PromptStateMachine<'a> {
     emit: Box<dyn FnMut(PromptEvent) + Send + 'a>,
     started: bool,
     terminal: bool,
+    pending_tools: Vec<PendingTool>,
+    line_count: usize,
+    at_line_start: bool,
+}
+
+const MAX_PENDING_TOOLS: usize = 64;
+
+struct PendingTool {
+    id: Option<String>,
+    name: String,
+    arguments: Value,
+    truncated: bool,
 }
 
 impl<'a> PromptStateMachine<'a> {
@@ -447,6 +510,9 @@ impl<'a> PromptStateMachine<'a> {
             emit: Box::new(emit),
             started: false,
             terminal: false,
+            pending_tools: Vec::new(),
+            line_count: 0,
+            at_line_start: true,
         }
     }
 
@@ -492,9 +558,30 @@ impl<'a> PromptStateMachine<'a> {
                     );
                     return;
                 }
+                self.emit_tool_matches(&content);
                 (self.emit)(PromptEvent::Delta {
                     request_id: self.request_id.clone(),
                     content,
+                });
+            }
+            ServerFrame::Tool {
+                id,
+                name,
+                arguments,
+                truncated,
+            } => {
+                if !self.started {
+                    return;
+                }
+                if self.pending_tools.len() >= MAX_PENDING_TOOLS {
+                    self.pending_tools.clear();
+                    return;
+                }
+                self.pending_tools.push(PendingTool {
+                    id,
+                    name,
+                    arguments,
+                    truncated,
                 });
             }
             ServerFrame::Done { metadata } => {
@@ -505,6 +592,7 @@ impl<'a> PromptStateMachine<'a> {
                     );
                     return;
                 }
+                self.pending_tools.clear();
                 self.terminal = true;
                 (self.emit)(PromptEvent::Done {
                     request_id: self.request_id.clone(),
@@ -513,6 +601,7 @@ impl<'a> PromptStateMachine<'a> {
                 });
             }
             ServerFrame::Error { message } => {
+                self.pending_tools.clear();
                 self.terminal = true;
                 (self.emit)(PromptEvent::Error {
                     request_id: self.request_id.clone(),
@@ -522,6 +611,35 @@ impl<'a> PromptStateMachine<'a> {
                 });
             }
         }
+    }
+
+    fn emit_tool_matches(&mut self, content: &str) {
+        let segments: Vec<&str> = content.split('\n').collect();
+        let base = self.line_count;
+        let mut candidates = Vec::new();
+        for (position, segment) in segments.iter().enumerate() {
+            let is_new = position > 0 || self.at_line_start;
+            if is_new && !segment.trim().is_empty() {
+                candidates.push(base + position);
+            }
+        }
+
+        let matched = self.pending_tools.len().min(candidates.len());
+        let tools: Vec<PendingTool> = self.pending_tools.drain(..matched).collect();
+        for (tool, line_index) in tools.into_iter().zip(candidates) {
+            (self.emit)(PromptEvent::Tool {
+                request_id: self.request_id.clone(),
+                session_id: self.expected_session_id.clone(),
+                id: tool.id,
+                name: tool.name,
+                arguments: tool.arguments,
+                truncated: tool.truncated,
+                line_index,
+            });
+        }
+
+        self.line_count += segments.len() - 1;
+        self.at_line_start = content.is_empty() || content.ends_with('\n');
     }
 
     pub fn handle_eof(&mut self) {
@@ -550,6 +668,7 @@ impl<'a> PromptStateMachine<'a> {
     }
 
     fn fail(&mut self, code: ErrorCode, message: impl Into<String>) {
+        self.pending_tools.clear();
         self.terminal = true;
         (self.emit)(PromptEvent::Error {
             request_id: self.request_id.clone(),
@@ -665,6 +784,62 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_tool_frame_with_every_field() {
+        let frame = parse_server_frame(
+            r#"{"type":"tool","id":"call-1","name":"web_search","arguments":{"query":"rust"},"truncated":true}"#,
+        )
+        .expect("tool")
+        .expect("frame");
+
+        assert_eq!(
+            frame,
+            ServerFrame::Tool {
+                id: Some("call-1".to_owned()),
+                name: "web_search".to_owned(),
+                arguments: serde_json::json!({ "query": "rust" }),
+                truncated: true,
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_invalid_optional_tool_fields() {
+        let frame = parse_server_frame(
+            r#"{"type":"tool","id":7,"name":"web_search","arguments":{},"truncated":"yes"}"#,
+        )
+        .expect("tool")
+        .expect("frame");
+
+        assert_eq!(
+            frame,
+            ServerFrame::Tool {
+                id: None,
+                name: "web_search".to_owned(),
+                arguments: serde_json::json!({}),
+                truncated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_unusable_tool_frames() {
+        for line in [
+            r#"{"type":"tool","arguments":{}}"#,
+            r#"{"type":"tool","name":"","arguments":{}}"#,
+            r#"{"type":"tool","name":5,"arguments":{}}"#,
+            r#"{"type":"tool","name":"web_search"}"#,
+            r#"{"type":"tool","name":"web_search","arguments":[]}"#,
+            r#"{"type":"tool","name":"web_search","arguments":"query"}"#,
+            r#"{"type":"tool","name":"web_search","arguments":null}"#,
+        ] {
+            assert!(
+                parse_server_frame(line).expect("usable JSON").is_none(),
+                "expected unusable tool frame to be ignored: {line}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_malformed_json() {
         let error = parse_server_frame("not json").expect_err("invalid");
         assert_eq!(error.code, ErrorCode::Protocol);
@@ -727,6 +902,7 @@ mod tests {
             .map(|event| match event {
                 PromptEvent::Start { .. } => "start",
                 PromptEvent::Delta { .. } => "delta",
+                PromptEvent::Tool { .. } => "tool",
                 PromptEvent::Done { .. } => "done",
                 PromptEvent::Cancelled { .. } => "cancelled",
                 PromptEvent::Error { .. } => "error",
@@ -1007,5 +1183,271 @@ mod tests {
                 metadata: None,
             }
         );
+    }
+
+    fn tool(name: &str) -> ServerFrame {
+        ServerFrame::Tool {
+            id: Some(format!("call-{name}")),
+            name: name.to_owned(),
+            arguments: serde_json::json!({ "query": name }),
+            truncated: false,
+        }
+    }
+
+    fn start(machine: &mut PromptStateMachine<'_>) {
+        machine.handle_frame(ServerFrame::Start {
+            session_id: "session-1".to_owned(),
+        });
+    }
+
+    fn delta(machine: &mut PromptStateMachine<'_>, content: &str) {
+        machine.handle_frame(ServerFrame::Delta {
+            content: content.to_owned(),
+        });
+    }
+
+    fn reconstructed(events: &[PromptEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PromptEvent::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_matches(events: &[PromptEvent]) -> Vec<(&str, usize)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PromptEvent::Tool {
+                    name, line_index, ..
+                } => Some((name.as_str(), *line_index)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ignores_tool_frames_before_start() {
+        let (events, settled) = run(|machine| {
+            machine.handle_frame(tool("web_search"));
+            start(machine);
+            delta(machine, "hello");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "delta"]);
+        assert!(tool_matches(&events).is_empty());
+        assert_eq!(reconstructed(&events), "hello");
+        assert!(!settled);
+    }
+
+    #[test]
+    fn ignores_tool_frames_after_a_terminal_frame() {
+        let (events, settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(ServerFrame::Done { metadata: None });
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "late");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "done"]);
+        assert!(tool_matches(&events).is_empty());
+        assert_eq!(reconstructed(&events), "");
+        assert!(settled);
+    }
+
+    #[test]
+    fn emits_a_tool_before_the_delta_that_introduces_its_line() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "Searching the web");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "tool", "delta"]);
+        assert_eq!(tool_matches(&events), vec![("web_search", 0)]);
+        match &events[1] {
+            PromptEvent::Tool {
+                request_id,
+                session_id,
+                id,
+                arguments,
+                truncated,
+                ..
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(session_id, "session-1");
+                assert_eq!(id.as_deref(), Some("call-web_search"));
+                assert_eq!(arguments, &serde_json::json!({ "query": "web_search" }));
+                assert!(!truncated);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_blank_lines_when_matching_tools() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "\n  \nresult");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "tool", "delta"]);
+        assert_eq!(tool_matches(&events), vec![("web_search", 2)]);
+        assert_eq!(reconstructed(&events), "\n  \nresult");
+    }
+
+    #[test]
+    fn does_not_match_a_continuation_delta() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            delta(machine, "partial");
+            machine.handle_frame(tool("web_search"));
+            delta(machine, " continuation");
+            delta(machine, "\nnext");
+        });
+
+        assert_eq!(
+            event_types(&events),
+            vec!["start", "delta", "delta", "tool", "delta"]
+        );
+        assert_eq!(tool_matches(&events), vec![("web_search", 1)]);
+        assert_eq!(reconstructed(&events), "partial continuation\nnext");
+    }
+
+    #[test]
+    fn matches_a_line_split_across_deltas_on_its_first_fragment() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "par");
+            delta(machine, "tial\nnext");
+        });
+
+        assert_eq!(
+            event_types(&events),
+            vec!["start", "tool", "delta", "delta"]
+        );
+        assert_eq!(tool_matches(&events), vec![("web_search", 0)]);
+        assert_eq!(reconstructed(&events), "partial\nnext");
+    }
+
+    #[test]
+    fn counts_earlier_lines_when_indexing() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            delta(machine, "one\ntwo\n");
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "three");
+        });
+
+        assert_eq!(tool_matches(&events), vec![("web_search", 2)]);
+        assert_eq!(reconstructed(&events), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn matches_multiple_tools_to_successive_new_lines() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("first"));
+            machine.handle_frame(tool("second"));
+            delta(machine, "alpha\nbeta");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "tool", "tool", "delta"]);
+        assert_eq!(tool_matches(&events), vec![("first", 0), ("second", 1)]);
+    }
+
+    #[test]
+    fn retains_unmatched_tools_for_later_deltas() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("first"));
+            machine.handle_frame(tool("second"));
+            delta(machine, "alpha");
+            delta(machine, "\nbeta");
+        });
+
+        assert_eq!(
+            event_types(&events),
+            vec!["start", "tool", "delta", "tool", "delta"]
+        );
+        assert_eq!(tool_matches(&events), vec![("first", 0), ("second", 1)]);
+    }
+
+    #[test]
+    fn discards_unmatched_tools_at_done() {
+        let (events, settled) = run(|machine| {
+            start(machine);
+            machine.handle_frame(tool("web_search"));
+            machine.handle_frame(ServerFrame::Done { metadata: None });
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "done"]);
+        assert!(tool_matches(&events).is_empty());
+        assert!(settled);
+    }
+
+    #[test]
+    fn clears_pending_tools_when_the_cap_is_exceeded() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            for _ in 0..=MAX_PENDING_TOOLS {
+                machine.handle_frame(tool("web_search"));
+            }
+            delta(machine, "line");
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "delta"]);
+        assert!(tool_matches(&events).is_empty());
+        assert_eq!(reconstructed(&events), "line");
+    }
+
+    #[test]
+    fn empty_deltas_do_not_change_reconstructed_content() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            delta(machine, "");
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "x");
+            delta(machine, "");
+            delta(machine, "\n");
+            delta(machine, "y");
+        });
+
+        assert_eq!(tool_matches(&events), vec![("web_search", 0)]);
+        assert_eq!(reconstructed(&events), "x\ny");
+    }
+
+    #[test]
+    fn whitespace_only_lines_do_not_consume_tools() {
+        let (events, _settled) = run(|machine| {
+            start(machine);
+            delta(machine, "a\n \t \n");
+            machine.handle_frame(tool("web_search"));
+            delta(machine, "b");
+        });
+
+        assert_eq!(tool_matches(&events), vec![("web_search", 2)]);
+        assert_eq!(reconstructed(&events), "a\n \t \nb");
+    }
+
+    #[test]
+    fn drops_a_tool_with_no_following_text_at_a_terminal_error() {
+        let (events, settled) = run(|machine| {
+            start(machine);
+            delta(machine, "partial");
+            machine.handle_frame(tool("web_search"));
+            machine.handle_frame(ServerFrame::Error {
+                message: "model overloaded".to_owned(),
+            });
+        });
+
+        assert_eq!(event_types(&events), vec!["start", "delta", "error"]);
+        assert!(tool_matches(&events).is_empty());
+        assert_eq!(reconstructed(&events), "partial");
+        assert!(settled);
     }
 }

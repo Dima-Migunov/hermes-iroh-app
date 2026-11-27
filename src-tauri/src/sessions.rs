@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::errors::{AppError, ErrorCode};
 use crate::protocol::{
     MessageRole, MessageStatus, ResponseMetadata, SessionDeletionResult, SessionSnapshot,
-    SessionSummary, StoredError, StoredMessage,
+    SessionSummary, StoredError, StoredMessage, ToolCall,
 };
 use crate::storage::history::{write_document, HistoryIndex, HistoryStore};
 
@@ -591,6 +591,7 @@ impl SessionStore {
                 content: text.to_owned(),
                 created_at: created_at.clone(),
                 status: MessageStatus::Complete,
+                tool_calls: None,
                 error: None,
                 metadata: None,
             };
@@ -641,6 +642,7 @@ impl SessionStore {
             content: String::new(),
             created_at: created_at.clone(),
             status: MessageStatus::Streaming,
+            tool_calls: None,
             error: None,
             metadata: None,
         };
@@ -667,6 +669,21 @@ impl SessionStore {
         };
 
         message.content.push_str(content);
+        let updated_at = now_iso(&inner);
+        touch_session(&mut inner, session_id, &updated_at);
+        schedule_save(&mut inner, &self.inner, session_id);
+    }
+
+    pub async fn append_tool_call(&self, session_id: &str, message_id: &str, call: ToolCall) {
+        let mut inner = self.inner.lock().await;
+        let Some(messages) = inner.messages.get_mut(session_id) else {
+            return;
+        };
+        let Some(message) = messages.iter_mut().find(|message| message.id == message_id) else {
+            return;
+        };
+
+        message.tool_calls.get_or_insert_with(Vec::new).push(call);
         let updated_at = now_iso(&inner);
         touch_session(&mut inner, session_id, &updated_at);
         schedule_save(&mut inner, &self.inner, session_id);
@@ -1256,6 +1273,7 @@ mod tests {
                     content: "partial".to_owned(),
                     created_at: "2026-01-01T00:00:00.000Z".to_owned(),
                     status: MessageStatus::Streaming,
+                    tool_calls: None,
                     error: None,
                     metadata: None,
                 }],
@@ -1371,6 +1389,191 @@ mod tests {
         assert_eq!(restored.status, MessageStatus::Complete);
         assert_eq!(restored.content, "Hello");
         assert_eq!(restored.metadata, Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn appends_and_restores_tool_calls_in_order() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "use a tool")
+            .await
+            .expect("append");
+        let assistant = harness
+            .store
+            .begin_assistant_message(&session_id)
+            .await
+            .expect("assistant");
+        harness
+            .store
+            .append_delta(&session_id, &assistant.id, "line one\nline two")
+            .await;
+        harness
+            .store
+            .append_tool_call(
+                &session_id,
+                &assistant.id,
+                ToolCall {
+                    id: Some("call-1".to_owned()),
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                },
+            )
+            .await;
+        harness
+            .store
+            .append_tool_call(
+                &session_id,
+                &assistant.id,
+                ToolCall {
+                    id: None,
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({ "path": "README.md" }),
+                    truncated: true,
+                    line_index: 1,
+                },
+            )
+            .await;
+        harness
+            .store
+            .complete_assistant(&session_id, &assistant.id, None)
+            .await
+            .expect("complete");
+
+        let reopened = reopen(&harness.directory).await;
+        let snapshot = reopened.get_active_snapshot().await.expect("snapshot");
+        let restored = snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == assistant.id)
+            .expect("assistant");
+        let calls = restored.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["query"], "docs");
+        assert_eq!(calls[0].line_index, 0);
+        assert_eq!(calls[1].id, None);
+        assert_eq!(calls[1].name, "read");
+        assert!(calls[1].truncated);
+        assert_eq!(calls[1].line_index, 1);
+    }
+
+    #[tokio::test]
+    async fn retains_tool_calls_on_interrupted_messages() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "stop me")
+            .await
+            .expect("append");
+        let assistant = harness
+            .store
+            .begin_assistant_message(&session_id)
+            .await
+            .expect("assistant");
+        harness
+            .store
+            .append_delta(&session_id, &assistant.id, "partial answer")
+            .await;
+        harness
+            .store
+            .append_tool_call(
+                &session_id,
+                &assistant.id,
+                ToolCall {
+                    id: Some("call-1".to_owned()),
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                },
+            )
+            .await;
+        harness
+            .store
+            .interrupt_assistant(&session_id, Some(&assistant.id))
+            .await
+            .expect("interrupt");
+
+        let reopened = reopen(&harness.directory).await;
+        let snapshot = reopened.get_active_snapshot().await.expect("snapshot");
+        let restored = snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == assistant.id)
+            .expect("assistant");
+        assert_eq!(restored.status, MessageStatus::Interrupted);
+        assert_eq!(restored.content, "partial answer");
+        let calls = restored.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].line_index, 0);
+    }
+
+    #[tokio::test]
+    async fn retains_tool_calls_on_failed_messages() {
+        let harness = harness(5);
+        harness.store.initialize().await.expect("initialize");
+        let session_id = harness.store.get_active_session_id().await.expect("active");
+        harness
+            .store
+            .append_user_message(&session_id, "fail me")
+            .await
+            .expect("append");
+        let assistant = harness
+            .store
+            .begin_assistant_message(&session_id)
+            .await
+            .expect("assistant");
+        harness
+            .store
+            .append_delta(&session_id, &assistant.id, "partial answer")
+            .await;
+        harness
+            .store
+            .append_tool_call(
+                &session_id,
+                &assistant.id,
+                ToolCall {
+                    id: None,
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                },
+            )
+            .await;
+        harness
+            .store
+            .fail_request(
+                &session_id,
+                Some(&assistant.id),
+                ErrorCode::Server,
+                "the server failed",
+            )
+            .await
+            .expect("fail");
+
+        let reopened = reopen(&harness.directory).await;
+        let snapshot = reopened.get_active_snapshot().await.expect("snapshot");
+        let restored = snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == assistant.id)
+            .expect("assistant");
+        assert_eq!(restored.status, MessageStatus::Failed);
+        assert_eq!(restored.content, "partial answer");
+        let calls = restored.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].line_index, 0);
     }
 
     #[tokio::test]
@@ -2002,6 +2205,7 @@ mod tests {
             content: "hello".to_owned(),
             created_at: "2026-01-01T00:00:00.000Z".to_owned(),
             status: MessageStatus::Complete,
+            tool_calls: None,
             error: None,
             metadata: None,
         };

@@ -711,6 +711,7 @@ mod tests {
             .map(|event| match event {
                 PromptEvent::Start { .. } => "start",
                 PromptEvent::Delta { .. } => "delta",
+                PromptEvent::Tool { .. } => "tool",
                 PromptEvent::Done { .. } => "done",
                 PromptEvent::Cancelled { .. } => "cancelled",
                 PromptEvent::Error { .. } => "error",
@@ -1023,6 +1024,77 @@ mod tests {
         .await;
 
         assert_eq!(event_types(&events), vec!["start", "delta", "done"]);
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_a_tool_frame_before_the_line_it_annotates() {
+        let (server, ticket) = start_mock_server(|_connection, mut send, mut recv| async move {
+            let _ = read_prompt_line(&mut recv).await;
+            write_line(
+                &mut send,
+                serde_json::json!({ "type": "start", "session_id": "session-1" }),
+            )
+            .await;
+            write_line(
+                &mut send,
+                serde_json::json!({
+                    "type": "tool",
+                    "id": "call-1",
+                    "name": "search",
+                    "arguments": { "query": "docs" },
+                    "truncated": true
+                }),
+            )
+            .await;
+            write_line(
+                &mut send,
+                serde_json::json!({ "type": "delta", "content": "searching\n" }),
+            )
+            .await;
+            write_line(&mut send, serde_json::json!({ "type": "done" })).await;
+            let _ = send.finish();
+        })
+        .await;
+
+        let client = create_client(ticket, None);
+        let events = collect_prompt(
+            &client,
+            "request-1",
+            "session-1",
+            "hello",
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(event_types(&events), vec!["start", "tool", "delta", "done"]);
+        match &events[1] {
+            PromptEvent::Tool {
+                id,
+                name,
+                arguments,
+                truncated,
+                line_index,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("call-1"));
+                assert_eq!(name, "search");
+                assert_eq!(arguments["query"], "docs");
+                assert!(*truncated);
+                assert_eq!(*line_index, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                PromptEvent::Delta { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "searching\n");
 
         client.close().await;
         server.close().await;

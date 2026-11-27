@@ -9,6 +9,7 @@ import type {
   SessionSnapshot,
   SessionSummary,
   StoredMessage,
+  ToolCall,
 } from '@shared/protocol'
 
 export interface NoticeEntry extends AppNotice {
@@ -89,6 +90,13 @@ export type ChatAction =
       type: 'prompt/delta'
       requestId: string
       chunks: string[]
+      createdAt: string
+    }
+  | {
+      type: 'prompt/tool'
+      requestId: string
+      sessionId: string
+      toolCall: ToolCall
       createdAt: string
     }
   | {
@@ -311,6 +319,58 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }
     }
 
+    case 'prompt/tool': {
+      if (!state.generating) return state
+      if (action.sessionId !== state.activeRequestSessionId) return state
+      if (state.activeRequestId !== 'pending' && state.activeRequestId !== action.requestId) {
+        return state
+      }
+      const sessionId = state.activeRequestSessionId
+      const assistantId = state.activeAssistantId ?? `assistant-${action.requestId}`
+      const messages = state.transcripts[sessionId] ?? EMPTY_MESSAGES
+      const existingIndex = messages.findIndex((message) => message.id === assistantId)
+
+      if (existingIndex === -1) {
+        const assistantMessage: StoredMessage = {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          createdAt: action.createdAt,
+          status: 'streaming',
+          toolCalls: [action.toolCall],
+        }
+        return {
+          ...state,
+          activeRequestId: action.requestId,
+          activeAssistantId: assistantId,
+          transcripts: {
+            ...state.transcripts,
+            [sessionId]: [...messages, assistantMessage],
+          },
+        }
+      }
+
+      const target = messages[existingIndex]
+      const existingCalls = target.toolCalls ?? []
+      if (
+        action.toolCall.id !== undefined &&
+        existingCalls.some((call) => call.id === action.toolCall.id)
+      ) {
+        return state
+      }
+
+      const updated = messages.map((message, index) =>
+        index === existingIndex
+          ? { ...message, toolCalls: [...existingCalls, action.toolCall] }
+          : message,
+      )
+      return {
+        ...state,
+        activeRequestId: action.requestId,
+        transcripts: { ...state.transcripts, [sessionId]: updated },
+      }
+    }
+
     case 'prompt/done': {
       if (!state.generating) return state
       if (action.sessionId !== state.activeRequestSessionId) return state
@@ -516,6 +576,20 @@ export function applyPromptEventToState(
         type: 'prompt/delta',
         requestId: event.requestId,
         chunks: [event.content],
+        createdAt,
+      })
+    case 'tool':
+      return chatReducer(state, {
+        type: 'prompt/tool',
+        requestId: event.requestId,
+        sessionId: event.sessionId,
+        toolCall: {
+          id: event.id,
+          name: event.name,
+          arguments: event.arguments,
+          truncated: event.truncated,
+          lineIndex: event.lineIndex,
+        },
         createdAt,
       })
     case 'done':

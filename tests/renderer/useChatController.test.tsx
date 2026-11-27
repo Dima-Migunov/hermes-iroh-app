@@ -571,4 +571,65 @@ describe('useChatController delta batching', () => {
     expect(assistant?.content).toBe('abc')
     expect(assistant?.status).toBe('streaming')
   })
+
+  it('flushes buffered text before a tool event and batches the following text', async () => {
+    await mount()
+    api.sendPrompt.mockResolvedValue({ requestId: 'request-1' })
+
+    await act(async () => {
+      await controller.sendPrompt('hello')
+    })
+    await act(async () => {
+      promptHandlers[0]?.({
+        requestId: 'request-1',
+        type: 'start',
+        sessionId: 'session-a',
+      })
+    })
+
+    vi.useFakeTimers()
+    try {
+      await act(async () => {
+        promptHandlers[0]?.({ requestId: 'request-1', type: 'delta', content: 'before\n' })
+      })
+      await act(async () => {
+        promptHandlers[0]?.({
+          requestId: 'request-1',
+          type: 'tool',
+          sessionId: 'session-a',
+          id: 'call-1',
+          name: 'search',
+          arguments: { query: 'docs' },
+          truncated: false,
+          lineIndex: 1,
+        })
+      })
+
+      const afterTool = controller.state.transcripts['session-a']?.[1]
+      expect(afterTool?.content).toBe('before\n')
+      expect(afterTool?.toolCalls).toEqual([
+        {
+          id: 'call-1',
+          name: 'search',
+          arguments: { query: 'docs' },
+          truncated: false,
+          lineIndex: 1,
+        },
+      ])
+
+      await act(async () => {
+        promptHandlers[0]?.({ requestId: 'request-1', type: 'delta', content: 'after\n' })
+      })
+      await act(async () => {
+        vi.advanceTimersByTime(60)
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+
+    const assistant = controller.state.transcripts['session-a']?.[1]
+    expect(assistant?.content).toBe('before\nafter\n')
+    expect(assistant?.toolCalls).toHaveLength(1)
+    expect(assistant?.status).toBe('streaming')
+  })
 })

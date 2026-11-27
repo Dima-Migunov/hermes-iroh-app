@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::errors::{AppError, ErrorCode};
 use crate::events::EventSink;
 use crate::iroh::client::{IrohClient, PromptStreamRequest};
-use crate::protocol::{PromptEvent, PromptSubmissionResult};
+use crate::protocol::{PromptEvent, PromptSubmissionResult, ToolCall};
 use crate::sessions::{IdFactory, SessionStore};
 
 pub type PromptTransportRef = Arc<dyn PromptTransport>;
@@ -512,6 +512,40 @@ async fn run_prompt(
                 terminal_seen = true;
                 break;
             }
+            PromptEvent::Tool {
+                id,
+                name,
+                arguments,
+                truncated,
+                line_index,
+                ..
+            } => {
+                let Some(message_id) = assistant_message_id.as_deref() else {
+                    continue;
+                };
+                sessions
+                    .append_tool_call(
+                        &request.session_id,
+                        message_id,
+                        ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            truncated,
+                            line_index,
+                        },
+                    )
+                    .await;
+                events.prompt_event(PromptEvent::Tool {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    id,
+                    name,
+                    arguments,
+                    truncated,
+                    line_index,
+                });
+            }
             PromptEvent::Delta { content, .. } => {
                 streamed_bytes = streamed_bytes.saturating_add(content.len());
                 if streamed_bytes > MAX_RESPONSE_BYTES {
@@ -642,7 +676,9 @@ async fn release_request(
 pub mod tests {
     use super::*;
     use crate::events::EventSink;
-    use crate::protocol::{AppNotice, ConnectionStatus, PromptEvent, ResponseMetadata};
+    use crate::protocol::{
+        AppNotice, ConnectionStatus, MessageRole, PromptEvent, ResponseMetadata, ToolCall,
+    };
     use crate::sessions::{SessionStore, SessionStoreOptions};
     use crate::storage::history::HistoryStore;
     use std::pin::Pin;
@@ -764,6 +800,7 @@ pub mod tests {
             .map(|event| match event {
                 PromptEvent::Start { .. } => "start",
                 PromptEvent::Delta { .. } => "delta",
+                PromptEvent::Tool { .. } => "tool",
                 PromptEvent::Done { .. } => "done",
                 PromptEvent::Cancelled { .. } => "cancelled",
                 PromptEvent::Error { .. } => "error",
@@ -1591,6 +1628,7 @@ pub mod tests {
             .map(|event| match event {
                 PromptEvent::Start { .. } => "start",
                 PromptEvent::Delta { .. } => "delta",
+                PromptEvent::Tool { .. } => "tool",
                 PromptEvent::Done { .. } => "done",
                 PromptEvent::Cancelled { .. } => "cancelled",
                 PromptEvent::Error { .. } => "error",
@@ -1700,6 +1738,356 @@ pub mod tests {
             "buffered text is preserved: {:?}",
             assistant.content
         );
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    struct ToolProbeSink {
+        sessions: SessionStore,
+        session_id: String,
+        prompt_events: StdMutex<Vec<PromptEvent>>,
+        tool_snapshot: tokio::sync::mpsc::UnboundedSender<Vec<ToolCall>>,
+    }
+
+    impl EventSink for ToolProbeSink {
+        fn prompt_event(&self, event: PromptEvent) {
+            self.prompt_events
+                .lock()
+                .expect("events lock")
+                .push(event.clone());
+            if matches!(event, PromptEvent::Tool { .. }) {
+                let sessions = self.sessions.clone();
+                let session_id = self.session_id.clone();
+                let sender = self.tool_snapshot.clone();
+                tokio::spawn(async move {
+                    let snapshot = sessions.get_snapshot(&session_id).await.expect("snapshot");
+                    let calls = snapshot
+                        .messages
+                        .iter()
+                        .find(|message| message.role == MessageRole::Assistant)
+                        .and_then(|message| message.tool_calls.clone())
+                        .unwrap_or_default();
+                    let _ = sender.send(calls);
+                });
+            }
+        }
+
+        fn connection_status(&self, _status: ConnectionStatus) {}
+
+        fn history_changed(&self) {}
+
+        fn notice(&self, _notice: AppNotice) {}
+    }
+
+    #[tokio::test]
+    async fn persists_a_tool_call_before_emitting_the_tool_event() {
+        let directory = tempfile::tempdir().expect("temp dir").keep();
+        let sessions = SessionStore::new(
+            HistoryStore::new(directory.join("history")),
+            SessionStoreOptions {
+                debounce: Duration::from_millis(5),
+                ..Default::default()
+            },
+        );
+        sessions.initialize().await.expect("initialize");
+        let session_id = sessions
+            .get_active_session_id()
+            .await
+            .expect("active session");
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(ToolProbeSink {
+            sessions: sessions.clone(),
+            session_id: session_id.clone(),
+            prompt_events: StdMutex::new(Vec::new()),
+            tool_snapshot: sender,
+        });
+        let handler: TransportFn = Arc::new(|request| {
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "line\n".to_owned(),
+                });
+                (request.emit)(PromptEvent::Tool {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    id: Some("call-1".to_owned()),
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                });
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+            })
+        });
+        let coordinator = PromptCoordinator::new(
+            Arc::new(FakeTransport { handler }),
+            sessions.clone(),
+            sink.clone(),
+            Some(Arc::new(|| "request-1".to_owned())),
+        );
+
+        coordinator
+            .send_prompt(PromptSubmission {
+                session_id: session_id.clone(),
+                text: "use a tool".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        for _ in 0..200 {
+            if !coordinator.is_busy().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let calls = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the tool probe must observe the emitted event")
+            .expect("probe channel");
+        assert_eq!(
+            calls.len(),
+            1,
+            "the tool call must already be stored when the event is emitted"
+        );
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].line_index, 0);
+
+        let events = sink.prompt_events.lock().expect("events lock").clone();
+        assert_eq!(event_types(&events), vec!["start", "delta", "tool", "done"]);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn forwards_tool_events_between_buffered_deltas_in_order() {
+        let handler: TransportFn = Arc::new(|request| {
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "before\n".to_owned(),
+                });
+                (request.emit)(PromptEvent::Tool {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    id: Some("call-1".to_owned()),
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: true,
+                    line_index: 1,
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "after\n".to_owned(),
+                });
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "use a tool".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        harness.wait_until_idle().await;
+
+        let events = harness.sink.events();
+        assert_eq!(
+            event_types(&events),
+            vec!["start", "delta", "tool", "delta", "done"]
+        );
+        let tool = events
+            .iter()
+            .find(|event| matches!(event, PromptEvent::Tool { .. }))
+            .expect("tool event");
+        match tool {
+            PromptEvent::Tool {
+                id,
+                name,
+                arguments,
+                truncated,
+                line_index,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("call-1"));
+                assert_eq!(name, "search");
+                assert_eq!(arguments["query"], "docs");
+                assert!(*truncated);
+                assert_eq!(*line_index, 1);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(assistant.content, "before\nafter\n");
+        let calls = assistant.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].line_index, 1);
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn stores_one_tool_call_and_keeps_terminal_metadata() {
+        let metadata: ResponseMetadata = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "generated_at": "2026-11-21T12:00:00.000Z",
+            "latency_ms": 812,
+            "model": "gpt-5.1"
+        }))
+        .expect("metadata");
+        let emitted_metadata = metadata.clone();
+        let handler: TransportFn = Arc::new(move |request| {
+            let metadata = emitted_metadata.clone();
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Tool {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    id: Some("call-1".to_owned()),
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "searching the docs\n".to_owned(),
+                });
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: Some(Box::new(metadata)),
+                });
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "use a tool".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        harness.wait_until_idle().await;
+
+        assert_eq!(
+            event_types(&harness.sink.events()),
+            vec!["start", "tool", "delta", "done"]
+        );
+
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == MessageRole::Assistant)
+            .expect("assistant");
+        assert_eq!(assistant.status, crate::protocol::MessageStatus::Complete);
+        assert_eq!(assistant.content, "searching the docs\n");
+        assert_eq!(assistant.metadata, Some(metadata));
+        let calls = assistant.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].line_index, 0);
+
+        let _ = std::fs::remove_dir_all(&harness.directory);
+    }
+
+    #[tokio::test]
+    async fn ignores_a_tool_event_before_the_assistant_message_exists() {
+        let handler: TransportFn = Arc::new(|request| {
+            Box::pin(async move {
+                (request.emit)(PromptEvent::Tool {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    id: None,
+                    name: "search".to_owned(),
+                    arguments: serde_json::json!({ "query": "docs" }),
+                    truncated: false,
+                    line_index: 0,
+                });
+                (request.emit)(PromptEvent::Start {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                });
+                (request.emit)(PromptEvent::Delta {
+                    request_id: request.request_id.clone(),
+                    content: "ok\n".to_owned(),
+                });
+                (request.emit)(PromptEvent::Done {
+                    request_id: request.request_id.clone(),
+                    session_id: request.session_id.clone(),
+                    metadata: None,
+                });
+            })
+        });
+        let harness = Harness::new(handler).await;
+
+        harness
+            .coordinator
+            .send_prompt(PromptSubmission {
+                session_id: harness.session_id.clone(),
+                text: "use a tool".to_owned(),
+            })
+            .await
+            .expect("prompt");
+        harness.wait_until_idle().await;
+
+        assert_eq!(
+            event_types(&harness.sink.events()),
+            vec!["start", "delta", "done"]
+        );
+        let snapshot = harness
+            .sessions
+            .get_snapshot(&harness.session_id)
+            .await
+            .expect("snapshot");
+        let assistant = snapshot
+            .messages
+            .iter()
+            .find(|entry| entry.role == MessageRole::Assistant)
+            .expect("assistant");
+        assert!(assistant.tool_calls.is_none());
 
         let _ = std::fs::remove_dir_all(&harness.directory);
     }

@@ -8,7 +8,7 @@ use hermes_iroh_app_lib::storage::config::{ConfigStore, TargetValidator};
 use hermes_iroh_app_lib::storage::history::HistoryStore;
 use hermes_iroh_app_lib::storage::keys::KeyStore;
 use hermes_iroh_app_lib::targets::validate_server_target;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const LEGACY_CLIENT_NODE_ID: &str =
     "92e957601dd9a45fdbc2d532de0edd61c5edce14a2a17a31a411acc3759d814e";
@@ -105,6 +105,10 @@ async fn reads_and_writes_data_produced_by_an_earlier_desktop_build() {
     assert_eq!(alpha.messages[1].role, MessageRole::Assistant);
     assert_eq!(alpha.messages[1].status, MessageStatus::Complete);
     assert_eq!(alpha.messages[1].content, "Hello from the old build");
+    assert!(
+        alpha.messages[1].tool_calls.is_none(),
+        "a transcript written before tool calls must load without them"
+    );
 
     let metadata = alpha.messages[1].metadata.as_ref().expect("metadata");
     assert_eq!(metadata.schema, 1);
@@ -165,6 +169,65 @@ async fn reads_and_writes_data_produced_by_an_earlier_desktop_build() {
     )
     .expect("parse beta session");
     assert_eq!(raw_session["messages"][1]["status"], "interrupted");
+
+    let history = HistoryStore::new(directory.join("history"));
+    std::fs::write(
+        history.session_path("session-tools"),
+        json!({
+            "version": 1,
+            "sessionId": "session-tools",
+            "messages": [
+                {
+                    "id": "user-1",
+                    "role": "user",
+                    "content": "use a tool",
+                    "createdAt": "2026-01-03T00:00:00.000Z",
+                    "status": "complete"
+                },
+                {
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "content": "line one\nline two",
+                    "createdAt": "2026-01-03T00:00:01.000Z",
+                    "status": "complete",
+                    "toolCalls": [
+                        {
+                            "id": "call-1",
+                            "name": "search",
+                            "arguments": { "query": "docs" },
+                            "lineIndex": 0
+                        },
+                        {
+                            "name": "read",
+                            "arguments": { "path": "README.md" },
+                            "truncated": true,
+                            "lineIndex": 1
+                        }
+                    ]
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write a session with tool calls");
+    let with_tools = history.load_session("session-tools");
+    assert!(with_tools.warning.is_none());
+    assert_eq!(with_tools.messages.len(), 2);
+    let calls = with_tools.messages[1]
+        .tool_calls
+        .as_ref()
+        .expect("tool calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+    assert_eq!(calls[0].name, "search");
+    assert_eq!(calls[0].arguments["query"], "docs");
+    assert_eq!(calls[0].line_index, 0);
+    assert!(!calls[0].truncated);
+    assert_eq!(calls[1].id, None);
+    assert_eq!(calls[1].name, "read");
+    assert!(calls[1].truncated);
+    assert_eq!(calls[1].line_index, 1);
+    assert_eq!(with_tools.messages[1].content, "line one\nline two");
 
     let reopened = session_store(directory);
     reopened.initialize().await.expect("reopen sessions");

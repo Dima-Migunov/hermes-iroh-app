@@ -183,6 +183,19 @@ describe('renderer bridge', () => {
       sessionId: 's1',
     })
 
+    const toolEvent = {
+      type: 'tool',
+      requestId: 'r1',
+      sessionId: 's1',
+      id: 'call-1',
+      name: 'search',
+      arguments: { query: 'docs' },
+      truncated: true,
+      lineIndex: 2,
+    }
+    handlers.get('prompt:event')?.({ payload: toolEvent })
+    expect(promptHandler).toHaveBeenLastCalledWith(toolEvent)
+
     unsubscribePrompt()
     expect(stops.get('prompt:event')).toHaveBeenCalledTimes(1)
 

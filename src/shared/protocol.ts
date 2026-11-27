@@ -80,12 +80,21 @@ export interface ResponseMetadata {
   balance?: AccountBalance
 }
 
+export interface ToolCall {
+  id?: string
+  name: string
+  arguments: Record<string, unknown>
+  truncated?: boolean
+  lineIndex: number
+}
+
 export interface StoredMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
   createdAt: string
   status: MessageStatus
+  toolCalls?: ToolCall[]
   error?: {
     code: ErrorCode
     message: string
@@ -120,12 +129,29 @@ export interface ClientPromptFrame {
 export type ServerFrame =
   | { type: 'start'; session_id: string }
   | { type: 'delta'; content: string }
+  | {
+      type: 'tool'
+      id?: string
+      name: string
+      arguments: Record<string, unknown>
+      truncated?: boolean
+    }
   | { type: 'done'; metadata?: ResponseMetadata }
   | { type: 'error'; message: string }
 
 export type PromptEvent =
   | { requestId: string; type: 'start'; sessionId: string }
   | { requestId: string; type: 'delta'; content: string }
+  | {
+      requestId: string
+      type: 'tool'
+      sessionId: string
+      id?: string
+      name: string
+      arguments: Record<string, unknown>
+      truncated: boolean
+      lineIndex: number
+    }
   | { requestId: string; type: 'done'; sessionId: string; metadata?: ResponseMetadata }
   | { requestId: string; type: 'cancelled'; sessionId: string }
   | { requestId: string; type: 'error'; sessionId: string; code: ErrorCode; message: string }

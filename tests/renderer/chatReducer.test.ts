@@ -5,6 +5,7 @@ import type {
   SessionSnapshot,
   SessionSummary,
   StoredMessage,
+  ToolCall,
 } from '@shared/protocol'
 import {
   chatReducer,
@@ -200,6 +201,137 @@ describe('chatReducer transcript assembly', () => {
 
     expect(state.transcripts['session-a']).toHaveLength(2)
     expect(state.transcripts['session-a']?.[1]?.role).toBe('assistant')
+  })
+})
+
+describe('chatReducer tool calls', () => {
+  function toolCall(overrides: Partial<ToolCall> = {}): ToolCall {
+    return {
+      id: 'call-1',
+      name: 'search',
+      arguments: { query: 'docs' },
+      truncated: false,
+      lineIndex: 0,
+      ...overrides,
+    }
+  }
+
+  function streaming(): ChatState {
+    let state = bootstrapped()
+    state = sent(state)
+    state = chatReducer(state, { type: 'prompt/request', requestId: 'request-1' })
+    state = started(state)
+    return chatReducer(state, {
+      type: 'prompt/delta',
+      requestId: 'request-1',
+      chunks: ['searching\n'],
+      createdAt: '2026-01-01T00:00:05.000Z',
+    })
+  }
+
+  function withTool(state: ChatState, call: ToolCall): ChatState {
+    return chatReducer(state, {
+      type: 'prompt/tool',
+      requestId: 'request-1',
+      sessionId: 'session-a',
+      toolCall: call,
+      createdAt: '2026-01-01T00:00:06.000Z',
+    })
+  }
+
+  it('appends the first tool call to the active assistant message', () => {
+    const state = withTool(streaming(), toolCall())
+
+    expect(selectActiveMessages(state)[1]?.toolCalls).toEqual([toolCall()])
+  })
+
+  it('appends successive tool calls in arrival order', () => {
+    let state = withTool(streaming(), toolCall())
+    state = withTool(state, toolCall({ id: 'call-2', name: 'read', lineIndex: 2 }))
+
+    expect(selectActiveMessages(state)[1]?.toolCalls).toEqual([
+      toolCall(),
+      toolCall({ id: 'call-2', name: 'read', lineIndex: 2 }),
+    ])
+  })
+
+  it('creates the assistant message when the tool call arrives before start', () => {
+    let state = bootstrapped()
+    state = sent(state)
+    state = withTool(state, toolCall())
+
+    const assistant = selectActiveMessages(state)[1]
+    expect(assistant).toMatchObject({ id: 'assistant-request-1', status: 'streaming' })
+    expect(assistant?.toolCalls).toEqual([toolCall()])
+  })
+
+  it('deduplicates a tool call carrying an id that is already present', () => {
+    const state = withTool(streaming(), toolCall())
+    const repeated = withTool(state, toolCall({ name: 'duplicate' }))
+
+    expect(repeated).toBe(state)
+    expect(selectActiveMessages(repeated)[1]?.toolCalls).toEqual([toolCall()])
+  })
+
+  it('ignores a tool call for a stale request id', () => {
+    const state = streaming()
+    const stale = chatReducer(state, {
+      type: 'prompt/tool',
+      requestId: 'other-request',
+      sessionId: 'session-a',
+      toolCall: toolCall(),
+      createdAt: '2026-01-01T00:00:06.000Z',
+    })
+
+    expect(stale).toBe(state)
+    expect(selectActiveMessages(stale)[1]?.toolCalls).toBeUndefined()
+  })
+
+  it('keeps tool calls when the response completes', () => {
+    let state = withTool(streaming(), toolCall())
+    state = chatReducer(state, {
+      type: 'prompt/done',
+      requestId: 'request-1',
+      sessionId: 'session-a',
+    })
+
+    expect(selectActiveMessages(state)[1]).toMatchObject({
+      status: 'complete',
+      content: 'searching\n',
+      toolCalls: [toolCall()],
+    })
+  })
+
+  it('keeps tool calls when the response is cancelled', () => {
+    let state = withTool(streaming(), toolCall())
+    state = chatReducer(state, {
+      type: 'prompt/cancelled',
+      requestId: 'request-1',
+      sessionId: 'session-a',
+    })
+
+    expect(selectActiveMessages(state)[1]).toMatchObject({
+      status: 'interrupted',
+      content: 'searching\n',
+      toolCalls: [toolCall()],
+    })
+  })
+
+  it('keeps tool calls when the response fails', () => {
+    let state = withTool(streaming(), toolCall())
+    state = chatReducer(state, {
+      type: 'prompt/error',
+      requestId: 'request-1',
+      sessionId: 'session-a',
+      code: 'server',
+      message: 'server exploded',
+    })
+
+    expect(selectActiveMessages(state)[1]).toMatchObject({
+      status: 'failed',
+      content: 'searching\n',
+      toolCalls: [toolCall()],
+    })
   })
 })
 

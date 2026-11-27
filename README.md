@@ -408,12 +408,14 @@ Server response (JSON Lines):
 ```json
 {"type":"start","session_id":"<session id>"}
 {"type":"delta","content":"token"}
+{"type":"tool","name":"search","arguments":{"query":"docs"},"id":"call-1","truncated":false}
 {"type":"done","metadata":{"schema":1,"generated_at":"2026-11-21T12:00:00.000Z","latency_ms":812}}
 {"type":"error","message":"reason"}
 ```
 
 - `start` is required before deltas; the echoed session id must match the request.
 - `delta.content` is appended in arrival order.
+- `tool` is optional and described below. It never changes delta text or the terminal outcome.
 - `done` and `error` are terminal. Unknown frame types are ignored.
 - `done` may carry an optional `metadata` object. A bare `{"type":"done"}` remains valid and
   completes the response exactly as before. `error` never carries metadata.
@@ -421,7 +423,32 @@ Server response (JSON Lines):
   small right-aligned text under the message field. Metadata is never rendered inside transcript
   messages.
 - Malformed JSON, invalid UTF-8, missing fields on known frames, and lines over 1 MiB are
-  protocol errors that terminate the request.
+  protocol errors that terminate the request. The one exception is an unusable optional `tool`
+  frame, which is ignored.
+
+### Tool progress lines
+
+A server may send an optional `tool` frame after `start` and before the terminal frame to
+describe a tool call that the assistant is about to explain in its answer:
+
+```json
+{"type":"tool","name":"search","arguments":{"query":"docs"},"id":"call-1","truncated":false}
+```
+
+- `name` must be a non-empty string and `arguments` must be a JSON object. A frame without
+  either is ignored instead of failing the request; malformed JSON is still a protocol error.
+- `id` and `truncated` are optional. A non-string `id` is treated as absent, and a non-boolean
+  `truncated` as `false`.
+- The call is associated with the next new non-empty line introduced by subsequent `delta`
+  frames. The line index is zero-based over the full assistant content, including blank lines.
+  Text that continues an already started line never consumes a call. When several calls arrive
+  before one delta, they bind to successive new lines in frame order.
+- A tool frame before `start` or after the terminal frame is ignored. Calls that never match a
+  line are discarded when the response ends.
+- Tool frames are presentation-only: the stored content is exactly the concatenated delta text,
+  and the terminal outcome is unchanged. The client renders a focusable progress row with a
+  tooltip for each matched line. A server that sends no tool frames produces the same text-only
+  transcript as before.
 
 ### Response metadata
 
@@ -456,6 +483,39 @@ A successful `done` frame may include `metadata` describing the turn. The server
 - Connection reuse is attempted across prompts; if the server closes the connection, the next
   prompt reconnects before sending. While automatic reconnection is active, a closed connection
   is also re-established without waiting for the next prompt.
+
+### Stored tool calls
+
+Matched tool calls are persisted with the assistant message as an additive optional field:
+
+```json
+{
+  "id": "assistant-1",
+  "role": "assistant",
+  "content": "Searching the docs…\nHere is the answer.",
+  "createdAt": "2026-11-21T12:00:00.000Z",
+  "status": "complete",
+  "toolCalls": [
+    {
+      "id": "call-1",
+      "name": "search",
+      "arguments": { "query": "docs" },
+      "truncated": false,
+      "lineIndex": 1
+    }
+  ]
+}
+```
+
+- `toolCalls` is omitted when the assistant message has no matched calls. `id` and `truncated`
+  are omitted when unset.
+- Histories written before this field load unchanged with no tool rows; the field is not
+  required, so older builds can also read a newer transcript and keep its content.
+- Unusable entries are skipped when a session is loaded. A message remains readable even when
+  every stored call is invalid, and an otherwise invalid history file is still preserved as
+  `*.corrupt-*`.
+- Calls survive session switches, restart, interruption, and failure with the same content and
+  line indexes.
 
 ## Troubleshooting
 

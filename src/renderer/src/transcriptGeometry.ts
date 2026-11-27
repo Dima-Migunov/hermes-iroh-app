@@ -15,6 +15,79 @@ export const RAIL_TOP_INSET_PX = 32
 export const RAIL_BOTTOM_INSET_PX = 24
 /** Minimum vertical space between a tooltip and the chat edges. */
 export const TOOLTIP_MARGIN_PX = 12
+/** Gap kept between a tool-progress row and its tooltip. */
+export const TOOLTIP_GAP_PX = 6
+/** Preferred maximum width of an argument tooltip. */
+export const TOOLTIP_MAX_WIDTH_PX = 480
+/** Share of the chat height a tooltip may occupy before it scrolls internally. */
+export const TOOLTIP_MAX_HEIGHT_RATIO = 0.5
+
+export interface TooltipAnchor {
+  top: number
+  bottom: number
+  left: number
+  right: number
+}
+
+export interface TooltipViewport {
+  top: number
+  bottom: number
+  left: number
+  right: number
+}
+
+export interface TooltipPlacement {
+  top: number
+  left: number
+  maxWidth: number
+  maxHeight: number
+  above: boolean
+}
+
+/**
+ * Places a fixed tooltip next to a progress row, preferring below and flipping
+ * above near the bottom edge. The result is clamped to the chat viewport so a
+ * narrow or short area never pushes the card outside it; oversized content
+ * scrolls inside `maxHeight` instead of being clipped.
+ */
+export function placeTooltip(
+  anchor: TooltipAnchor,
+  viewport: TooltipViewport,
+  size: { width: number; height: number },
+  margin: number = TOOLTIP_MARGIN_PX,
+): TooltipPlacement {
+  const safeMargin = Math.max(0, margin)
+  const safeGap = TOOLTIP_GAP_PX
+  const viewportWidth = Math.max(0, viewport.right - viewport.left)
+  const viewportHeight = Math.max(0, viewport.bottom - viewport.top)
+  const availableWidth = Math.max(0, viewportWidth - safeMargin * 2)
+  const widthLimit = Math.min(TOOLTIP_MAX_WIDTH_PX, availableWidth)
+  const width = Math.max(0, Math.min(size.width, widthLimit))
+  const heightLimit = Math.min(viewportHeight * TOOLTIP_MAX_HEIGHT_RATIO, viewportHeight)
+  const desiredHeight = Math.max(0, Math.min(size.height, heightLimit))
+
+  const minLeft = viewport.left + safeMargin
+  const maxLeft = Math.max(minLeft, viewport.right - safeMargin - width)
+  const center = anchor.left + (anchor.right - anchor.left) / 2
+  const left = clamp(center - width / 2, minLeft, maxLeft)
+
+  const belowTop = anchor.bottom + safeGap
+  const aboveTop = anchor.top - safeGap - desiredHeight
+  const spaceBelow = viewport.bottom - safeMargin - belowTop
+  const spaceAbove = anchor.top - safeGap - (viewport.top + safeMargin)
+  const fitsBelow = spaceBelow >= desiredHeight
+  const fitsAbove = spaceAbove >= desiredHeight
+  const above = !fitsBelow && (fitsAbove || spaceAbove > spaceBelow)
+
+  const sideSpace = Math.max(0, above ? spaceAbove : spaceBelow)
+  const maxHeight = Math.max(0, Math.min(heightLimit, sideSpace || heightLimit))
+  const renderedHeight = Math.min(desiredHeight, maxHeight)
+  const minTop = viewport.top + safeMargin
+  const maxTop = Math.max(minTop, viewport.bottom - safeMargin - renderedHeight)
+  const top = clamp(above ? aboveTop : belowTop, minTop, maxTop)
+
+  return { top, left, maxWidth: widthLimit, maxHeight, above }
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max)
